@@ -29,8 +29,9 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { LlmPool, extractJsonObject } from './llm.ts';
+import { LlmPool, extractJsonObject, createRelay, splitKeys } from './llm.ts';
 import { researchNews, bingNews, researchRecipe, factSheet, unsupportedNumbers, visionMatches, visionAnatomy, metadataMatches, identifierTokens, type FactPack, type ResearchCtx } from './research.ts';
+import { stripScriptDirections } from './scriptClean.ts';
 import { composeBuffers, eqForVoice, automateLevel, levelDb, encodeWav, moodFor } from './music.ts';
 import { runAnimated, ANIM_CATEGORIES } from './anim/runner.ts';
 
@@ -71,15 +72,17 @@ const DEFAULT_YT_CLIENT_ID = '592242596648-am9pri2j11vmu44fdc6oau5p34aklkj8.apps
 // API keys are never stored in the render repository: the app sends them in
 // every dispatch (auth.*), or they come from repository secrets.
 
-const DIMENSIONS: Record<string, [number, number]> = { '9:16': [1080, 1920], '16:9': [1920, 1080], '1:1': [1080, 1080], '4:3': [1440, 1080] };
+const DIMENSIONS: Record<string, [number, number]> = { '9:16': [1080, 1920], '16:9': [1920, 1080], '1:1': [1080, 1080], '4:3': [1440, 1080], '4:5': [1080, 1350] };
 
 function resolveFormat(): { format: 'shorts' | 'video'; aspect: string } {
   const rawAspect = pick(JOB.aspect_ratio, INPUTS.aspect_ratio, ENV.ASPECT_RATIO, '9:16').replace('/', ':');
   let aspect = DIMENSIONS[rawAspect] ? rawAspect : '9:16';
   const rawFormat = pick(JOB.format, INPUTS.format, ENV.VIDEO_FORMAT).toLowerCase();
   const format: 'shorts' | 'video' = rawFormat === 'video' ? 'video' : rawFormat === 'shorts' ? 'shorts' : (aspect === '16:9' || aspect === '4:3' ? 'video' : 'shorts');
+  // A one-off music video or podcast from the app: the person chose the frame (TikTok 9:16, Instagram 4:5, YouTube 16:9) — use it as it is.
+  if (pick(JOB.studio_job, INPUTS.studio_job)) return { format, aspect };
   if (format === 'shorts' && (aspect === '16:9' || aspect === '4:3')) aspect = '9:16';
-  if (format === 'video' && (aspect === '9:16' || aspect === '1:1')) aspect = '16:9';
+  if (format === 'video' && (aspect === '9:16' || aspect === '1:1' || aspect === '4:5')) aspect = '16:9';
   return { format, aspect };
 }
 
@@ -123,8 +126,6 @@ const CFG = {
   ytClientId: pick(AUTH.youtube_client_id, ENV.YOUTUBE_CLIENT_ID, DEFAULT_YT_CLIENT_ID),
   ytClientSecret: pick(AUTH.youtube_client_secret, ENV.YOUTUBE_CLIENT_SECRET),
   // The script writer is the self-hosted model started by the workflow on this runner (no API keys).
-  localLlmUrl: pick(ENV.LOCAL_LLM_URL, 'http://127.0.0.1:8080/v1'),
-  localVlmUrl: pick(ENV.LOCAL_VLM_URL),
   geminiKeys: [] as string[],
   groqKeys: [] as string[],
   airforceKey: '',
@@ -134,7 +135,7 @@ const CFG = {
   // Music engine: ACE-Step 1.5 official cloud (free API key from https://acemusic.ai/api-key).
   // Personal project: built-in ACE-Step keys (rotated); a repository secret still overrides them.
   // Set to the local ACE-Step server on the runner while a song is being made.
-  acestepBase: 'http://127.0.0.1:8011',
+  acestepBase: pick(ENV.ACESTEP_BASE_URL, 'https://api.acemusic.ai'),
   acestepModel: pick(ENV.ACESTEP_MODEL, ''),
   // Musical song length (seconds), at most 60: intro → verse → pre-chorus → chorus → chorus again → outro.
   musicSeconds: Math.max(20, Math.min(60, parseInt(pick(ENV.MUSIC_SECONDS, '60'), 10) || 60)),
@@ -148,6 +149,8 @@ const CFG = {
   storyGenre: pick(JOB.story_genre, ENV.STORY_GENRE),
   animStyle: pick(JOB.anim_style, ENV.ANIM_STYLE),
   podcastAbout: pick(JOB.podcast_about, ENV.PODCAST_ABOUT),
+  podcastScript: pick(JOB.podcast_script, ENV.PODCAST_SCRIPT).slice(0, 8000),
+  musicalLyrics: pick(JOB.musical_lyrics, ENV.MUSICAL_LYRICS).slice(0, 3000),
   podcastGuests: pick(JOB.podcast_guests, ENV.PODCAST_GUESTS) === 'true',
   /** Musicals: the singer is the guest of her own show, interviewed about her latest songs. */
   podcastSinger: pick(JOB.podcast_singer, ENV.PODCAST_SINGER) === 'true',
@@ -202,7 +205,7 @@ const CFG = {
   maxRenderSeconds: parseInt(pick(ENV.MAX_VIDEO_SECONDS, '0'), 10) || 0,
   // Longest time a run spends waiting for ACE-Step before giving up (the next run retries).
   // Max minutes for ACE-Step on the runner (setup on the first run + making the song on the CPU).
-  acestepLocalMin: parseInt(pick(ENV.ACESTEP_LOCAL_MINUTES, '35'), 10) || 35
+  acestepLocalMin: parseInt(pick(ENV.ACESTEP_MAX_MINUTES, '6'), 10) || 6
 };
 
 /**
@@ -213,7 +216,9 @@ const CFG = {
 interface StudioJob {
   id: string; kind: string; title: string; script: string; voiceUrl: string; voiceGender: 'female' | 'male';
   cast: { name: string; gender: 'female' | 'male'; spec: any }[]; watermark: boolean; maxSeconds: number;
-  location: string; time: 'day' | 'night'; showCharacter: boolean; fast: boolean; scenes: { location?: string; time?: string; lines: { speaker: string; text: string }[] }[];
+  location: string; time: 'day' | 'night'; showCharacter: boolean; fast: boolean; musicMode?: 'auto' | 'upload' | 'none'; musicUrl?: string; scenes: { location?: string; time?: string; lines: { speaker: string; text: string }[] }[];
+  musicLanguage?: string; subGenre?: string; mood?: string; stageMode?: 'auto' | 'fixed'; stageId?: number;
+  podcastStudio?: any; podcastHosts?: any[]; adWebsiteUrl?: string; adBrief?: string; adImages?: string[]; adProfile?: any;
 }
 const STUDIO: StudioJob | null = (() => {
   const s = parseSpec(JOB.studio_job);
@@ -225,7 +230,12 @@ const STUDIO: StudioJob | null = (() => {
     cast: (Array.isArray(s.cast) ? s.cast : []).slice(0, 3).map((c: any, i: number) => ({ name: String(c?.name || `Character ${i + 1}`).slice(0, 24), gender: gender(c?.gender), spec: c?.spec || null })),
     watermark: s.watermark !== false, maxSeconds: Math.max(15, Math.min(300, Number(s.maxSeconds) || 60)),
     location: String(s.location || 'living_room'), time: s.time === 'night' ? 'night' : 'day', showCharacter: s.showCharacter !== false, fast: s.fast === true,
+    musicMode: s.musicMode === 'none' ? 'none' : s.musicMode === 'upload' ? 'upload' : 'auto', musicUrl: String(s.musicUrl || ''),
     scenes: Array.isArray(s.scenes) ? s.scenes.slice(0, 8) : [],
+    musicLanguage: String(s.musicLanguage || 'English').slice(0, 40), subGenre: String(s.subGenre || 'afrobeats').slice(0, 80), mood: String(s.mood || '').toLowerCase().replace(/[^a-z]/g, '').slice(0, 20),
+    stageMode: s.stageMode === 'fixed' ? 'fixed' : 'auto', stageId: Math.max(0, Math.min(1_000_000, Number(s.stageId) || 0)),
+    podcastStudio: s.podcastStudio || null, podcastHosts: Array.isArray(s.podcastHosts) ? s.podcastHosts.slice(0, 3) : [],
+    adWebsiteUrl: String(s.adWebsiteUrl || '').slice(0, 600), adBrief: String(s.adBrief || '').slice(0, 14000), adImages: Array.isArray(s.adImages) ? s.adImages.slice(0, 12).map(String) : [], adProfile: s.adProfile && typeof s.adProfile === 'object' ? s.adProfile : null,
   };
 })();
 
@@ -250,7 +260,8 @@ let SOCIAL: Record<string, any> = {};
 // Studio animations on the Free plan render at 720p: about twice as fast, still sharp on a phone.
 const [W, H] = STUDIO?.fast ? (DIMENSIONS[CFG.aspect].map((v) => Math.round((v * 2) / 3 / 2) * 2) as [number, number]) : DIMENSIONS[CFG.aspect];
 const FRAME_W = W, FRAME_H = H;
-const FPS = 30;
+// Creative Studio videos (music videos, podcasts) are made at 24 frames a second: 20% fewer frames to draw, the same look on a phone.
+const FPS = STUDIO ? 24 : 30;
 /** Minutes left before GitHub stops the job (JOB_TIMEOUT_MINUTES, default 60, minus setup time already used). */
 const PROCESS_T0 = Date.now();
 const jobMinutesLeft = () => (parseInt(process.env.JOB_TIMEOUT_MINUTES || '60', 10) || 60) - 3 - (Date.now() - PROCESS_T0) / 60000;
@@ -592,7 +603,7 @@ const clampNum = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v)
 // ---------------------------------------------------------------------------
 /** A performance cue placed before the `index`-th spoken word of a scene. */
 interface Cue { index: number; tag: string }
-interface Scene { narration: string; shot: 'scene' | 'panel' | 'full'; emotion: string; imagePrompt: string; searchQuery: string; cues: Cue[]; productShot?: boolean; imageCredit?: string }
+interface Scene { narration: string; shot: 'scene' | 'panel' | 'full'; emotion: string; imagePrompt: string; searchQuery: string; videoQuery?: string; cues: Cue[]; productShot?: boolean; imageCredit?: string }
 
 // ---------------------------------------------------------------------------
 // Performance tags: the script writer places [tags] inside the narration right
@@ -753,9 +764,12 @@ interface Script {
 // Script writer pool: Gemini (keys rotated per run, instant failover) → Groq.
 // An exhausted model is never retried in the same run (see llm.ts).
 // ---------------------------------------------------------------------------
+// Runners never hold the AI keys: the app server rotates them (Groq + Gemini + OpenRouter) and answers.
+// For local tests, keys in the environment (GROQ_API_KEYS …) are used directly instead.
+const RELAY = createRelay({ appUrl: CFG.appUrl, scope: STUDIO ? `animate:${STUDIO.id}` : `campaign:${CFG.campaignId}`, runnerKey: CFG.runnerKey });
 const LLM = new LlmPool({
-  localUrl: CFG.localLlmUrl,
-  visionUrl: CFG.localVlmUrl || undefined,
+  relay: RELAY.available ? (r) => RELAY.llm(r) : undefined,
+  groqKeys: splitKeys(ENV.GROQ_API_KEYS), geminiKeys: splitKeys(ENV.GEMINI_API_KEYS), openrouterKeys: splitKeys(ENV.OPENROUTER_API_KEYS),
   log: (m) => log(m),
   seed: parseInt(crypto.createHash('md5').update(`${CFG.campaignId}:${CFG.partNumber}:${CFG.runId}`).digest('hex').slice(0, 6), 16)
 });
@@ -936,7 +950,7 @@ function categoryBrief(pastStory: string, headlines: { title: string; source: st
 - Deepen the danger and reveal something that changes how the viewer reads Part 1 (who is really behind it, what the protagonist did, what is at stake).
 - The protagonist must DO something, fail or half-succeed, and end the part in worse trouble than they started.`;
       return `FORMAT: a complete short story told by a NARRATOR in the THIRD PERSON — a real story with a plot, not a monologue${sub}${topic}${known}${cont}
-- The presenter is the storyteller and NEVER a character in it. Use names and he/she/they, never "I" for the protagonist.
+- The narrator is an unseen voice (no presenter appears on screen) and is NEVER a character in the story. Never introduce yourself by name or say "I'm ...". Use names and he/she/they, never "I" for the protagonist.
 - The whole story runs for EXACTLY ${last} parts and this is part ${part}.
 ${arcStep}
 - Tone: ${tone}.
@@ -946,7 +960,8 @@ ${arcStep}
 - Short spoken sentences, past tense, plain words. Keep the viewer feeling it: sounds, smells, small physical details.
 ${part >= last ? '- The title must NOT contain "(Part ...)" if the story ends here; instead make it the story\'s own title.' : `- Title must end with "(Part ${part})".`}
 - Also return "premise": 2-3 sentences of what this story is about, who is in it and what has happened so far (the next part is written from this), and "characters": each named person's fixed look (age, build, hair, clothes) for the pictures.
-- imagePrompt: describe the exact moment of that scene as a still from a high-end 3D animated family film (big-studio feature quality) — WHO (named character as an ORIGINAL stylised cartoon character + their fixed look; never an existing movie character), WHERE (a cartoon version of the place), WHAT is happening, the light and the camera angle. Every person is a cartoon character with big expressive eyes and soft rounded features — never a real or photorealistic human. FRAMING (important — the image model draws faces and torsos well but mangles hands, full-body action and crowds): frame every scene as a medium shot or close-up of ONE or TWO characters, waist-up or head-and-shoulders, in a calm simple pose (standing, sitting, talking, looking), hands low or out of frame; put the story's action and place in the background and props. Never full-body running / jumping / fighting poses, never crowds or groups, never close-ups of fingers.`;
+- imagePrompt: describe the exact moment of that scene as a still from a high-end 3D animated family film (big-studio feature quality) — WHO (named character as an ORIGINAL stylised cartoon character + their fixed look; never an existing movie character), WHERE (a cartoon version of the place), WHAT is happening, the light and the camera angle. Every person is a cartoon character with big expressive eyes and soft rounded features — never a real or photorealistic human. FRAMING (important — the image model draws faces and torsos well but mangles hands, full-body action and crowds): frame every scene as a medium shot or close-up of ONE or TWO characters, waist-up or head-and-shoulders, in a calm simple pose (standing, sitting, talking, looking), hands low or out of frame; put the story's action and place in the background and props. Never full-body running / jumping / fighting poses, never crowds or groups, never close-ups of fingers.
+- videoQuery (every scene): 2-4 plain words describing REAL FOOTAGE that matches what is happening at that moment AND how it feels. The footage must be in line with the storyline, the scene and the words being spoken: a sad or painful scene gets quiet, sombre footage (woman crying window, empty room night, rain on glass), NEVER dancing, parties or laughing crowds; a happy scene gets warm, joyful footage. Describe it as as you would type it into a stock-video site: the place, the action and the mood (night village rain, man running dark street, old house door opening, woman crying window). Real-world places, weather, objects and people seen from behind or in silhouette work best; never character names, never abstract words.`;
     }
   }
 }
@@ -954,8 +969,8 @@ ${part >= last ? '- The title must NOT contain "(Part ...)" if the story ends he
 function buildPrompt(pastStory: string, pastTitles: string[], headlines: any[], pack: FactPack | null = null): string {
   const L = lengthSpec();
   const avoid = pastTitles.length ? `\nPrevious video titles (do NOT repeat these topics): ${pastTitles.slice(-35).join(' | ')}` : '';
-  return `You are writing a ${IS_SHORTS ? 'YouTube Short (vertical)' : 'YouTube video (16:9)'} of ${L.seconds}, narrated by an animated presenter${CFG.presenterName ? ` called ${CFG.presenterName}` : ''}.
-${categoryBrief(pastStory, headlines, pack)}${avoid}${CFG.performanceNotes ? `\n\nWHAT IS WORKING ON THIS CHANNEL (learn from it):\n${CFG.performanceNotes}` : ''}${CFG.presenterName ? `\nPRESENTER NAME: ${CFG.presenterName}. Whenever the presenter introduces themself or signs off, use this name (e.g. "Hi, I'm ${CFG.presenterName}") — never any other name.` : ''}
+  return `You are writing a ${IS_SHORTS ? 'YouTube Short (vertical)' : 'YouTube video (16:9)'} of ${L.seconds}, ${CFG.category === 'stories' ? 'narrated by an unseen voice-over narrator (no presenter or character appears on screen)' : `narrated by an animated presenter${CFG.presenterName ? ` called ${CFG.presenterName}` : ''}`}.
+${categoryBrief(pastStory, headlines, pack)}${avoid}${CFG.performanceNotes ? `\n\nWHAT IS WORKING ON THIS CHANNEL (learn from it):\n${CFG.performanceNotes}` : ''}${CFG.presenterName && CFG.category !== 'stories' ? `\nPRESENTER NAME: ${CFG.presenterName}. Whenever the presenter introduces themself or signs off, use this name (e.g. "Hi, I'm ${CFG.presenterName}") — never any other name.` : ''}
 
 RULES
 - Total narration: ${L.words} words across ${L.scenes} scenes. Each scene is 1-3 spoken sentences (8-40 words).
@@ -991,7 +1006,7 @@ Return ONLY this JSON (no markdown):
   "officialUrl": "tech/tutorials: the official website of the product (real URL only), else empty",
   "premise": "stories only: 2-3 sentences — who this story is about, where, and everything that has happened so far",
   "scenes": [
-    { "narration": "[emotion] spoken words with [gesture] tags where they land", "shot": "scene|panel|full", "emotion": "main emotion of the scene", "imagePrompt": "stories only: what the scene shows", "searchQuery": "stories: 2-4 words to find a matching CARTOON ILLUSTRATION (main subject + setting, e.g. \"fox forest night\"); everything else: real things to find a real photo of (names of people, products, places, dishes)", "productShot": false }
+    { "narration": "[emotion] spoken words with [gesture] tags where they land", "shot": "scene|panel|full", "emotion": "main emotion of the scene", "imagePrompt": "stories only: what the scene shows", "searchQuery": "stories: 2-4 words to find a matching CARTOON ILLUSTRATION (main subject + setting, e.g. \"fox forest night\"); everything else: real things to find a real photo of (names of people, products, places, dishes)", "videoQuery": "stories only: 2-4 words to find REAL STOCK FOOTAGE of this exact moment (the place, the action and the mood, e.g. night village rain, woman crying window, empty school corridor)", "productShot": false }
   ]
 }`;
 }
@@ -1212,6 +1227,7 @@ function normaliseScript(parsed: any, model: string, relaxed = false): Script {
         emotion: String(s?.emotion || 'neutral').toLowerCase().slice(0, 20),
         imagePrompt: String(s?.imagePrompt || s?.visual || '').trim().slice(0, 400),
         searchQuery: String(s?.searchQuery || '').replace(/[^\w\s'-]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80),
+        videoQuery: String(s?.videoQuery || '').replace(/[^\w\s'-]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60),
         productShot: s?.productShot === true || s?.product === true
       };
     })
@@ -1353,9 +1369,9 @@ async function generateScript(pastStory: string, pastTitles: string[], pastSourc
     else if (sc.sourceHeadline) sc.sourceStory = { title: sc.sourceHeadline, source: '', link: '' };
     return sc;
   };
-  if (!CFG.offline && !LLM.hasKeys) throw new PipelineError('script_failed', 'The AI model on the runner did not start.');
+  if (!CFG.offline && !LLM.hasKeys) throw new PipelineError('script_failed', 'No AI service is reachable: the runner has no app address / runner key and no AI keys.');
   if (!CFG.offline) {
-    log(`Script writer: the self-hosted model on this runner (${CFG.localLlmUrl}).`);
+    log('Script writer: hosted AI (rotating Groq / Gemini / OpenRouter keys).');
     const t0 = Date.now();
     for await (const a of LLM.attempts({
       system,
@@ -1439,7 +1455,7 @@ async function sceneByScene(system: string, prompt: string): Promise<any | null>
   const [wlo, whi] = String(L.words).split('-').map((x) => parseInt(x, 10));
   const per = Math.max(12, Math.round(((wlo || L.minWords) + (whi || L.maxWords)) / 2 / n));
   let plan: any = null;
-  const planUser = `${prompt}\n\nFIRST, ONLY PLAN THE VIDEO. Return ONE JSON object: {"title": "", "description": "2-3 sentences", "hashtags": ["5-8 without #"], "tags": ["5-10"], "visualStyle": "", "characters": "", "scenes": [{"beat": "what this scene says or shows, one line", "shot": "scene|panel|full", "emotion": "neutral", "imagePrompt": "", "searchQuery": ""}]} with EXACTLY ${n} scenes that build to a strong ending.`;
+  const planUser = `${prompt}\n\nFIRST, ONLY PLAN THE VIDEO. Return ONE JSON object: {"title": "", "description": "2-3 sentences", "hashtags": ["5-8 without #"], "tags": ["5-10"], "visualStyle": "", "characters": "", "scenes": [{"beat": "what this scene says or shows, one line", "shot": "scene|panel|full", "emotion": "neutral", "imagePrompt": "", "searchQuery": "", "videoQuery": "stories only: 2-4 words of real stock footage matching this scene"}]} with EXACTLY ${n} scenes that build to a strong ending.`;
   for await (const a of LLM.attempts({ system, user: planUser, temperature: 0.8, maxTokens: 3000, json: true, timeoutMs: 120000, task: 'script_plan' })) {
     try { const j = extractJson(a.text); if (Array.isArray(j?.scenes) && j.scenes.length >= Math.ceil(n * 0.7) && j.title) { plan = j; break; } } catch {}
   }
@@ -1456,7 +1472,7 @@ async function sceneByScene(system: string, prompt: string): Promise<any | null>
       if (t.split(' ').length >= 6) { text = t; break; }
     }
     if (!text) continue;
-    out.push({ narration: text, shot: sc.shot, emotion: sc.emotion, imagePrompt: sc.imagePrompt || sc.beat, searchQuery: sc.searchQuery });
+    out.push({ narration: text, shot: sc.shot, emotion: sc.emotion, imagePrompt: sc.imagePrompt || sc.beat, searchQuery: sc.searchQuery, videoQuery: String(sc.videoQuery || '').slice(0, 60) });
   }
   if (out.length < Math.ceil(n * 0.6)) return null;
   return { ...plan, scenes: out };
@@ -1565,6 +1581,7 @@ async function synthesizeNarration(script: string): Promise<Narration> {
   const voices = (VOICES[CFG.gender][CFG.category] || VOICES[CFG.gender].default);
 
   let lastTtsError = '';
+  let blocked403 = 0;
   if (!CFG.offline) {
     // Each voice at the category's pace, then at normal pace; short pause between
     // attempts so a transient Edge TTS hiccup does not cost the run.
@@ -1596,6 +1613,8 @@ async function synthesizeNarration(script: string): Promise<Narration> {
       }
       lastTtsError = r.stderr.trim().split('\n').filter(Boolean).slice(-2).join(' | ') || `exit ${r.code}`;
       log(`edge-tts with ${voice} (${rate}) failed (exit ${r.code}): ${lastTtsError}`);
+      // Microsoft is refusing this runner (HTTP 403): more voices will not help, switch engines now.
+      if (/\b403\b/.test(lastTtsError) && ++blocked403 >= 2) { log('Edge TTS keeps answering 403 - switching to the Piper neural voice on this runner.'); break; }
     }
   }
   LAST_TTS_ERROR = lastTtsError;
@@ -1619,6 +1638,25 @@ async function synthesizeNarration(script: string): Promise<Narration> {
   return { audioPath: wav, duration, words: estimateWordTimes(text, duration), wordsReliable: false, engine: `flite:${voice}`, neural: false };
 }
 
+/** Download any file (voice models, etc.) - unlike download(), which only accepts images. Retries twice. */
+async function downloadFile(url: string, file: string, timeoutMs = 120000): Promise<boolean> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(url, { headers: { 'User-Agent': 'AnimatoAutoPoster/3.0 (+https://github.com)' }, redirect: 'follow', signal: AbortSignal.timeout(timeoutMs) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length < 100) throw new Error('empty download');
+      fs.writeFileSync(file, buf);
+      return true;
+    } catch (e: any) {
+      log(`Download of ${path.basename(file)} failed (${String(e?.message || e).slice(0, 120)}) - attempt ${attempt + 1}/3.`);
+      try { fs.unlinkSync(file); } catch {}
+      await sleep(2000 * (attempt + 1));
+    }
+  }
+  return false;
+}
+
 /** Piper (rhasspy) neural text-to-speech, installed on the runner on first use. */
 async function piperNarration(textFile: string): Promise<{ file: string; duration: number; voice: string } | null> {
   const root = path.join(os.homedir(), 'animato-piper'), venv = path.join(root, 'venv'), py = path.join(venv, 'bin', 'python');
@@ -1634,7 +1672,7 @@ async function piperNarration(textFile: string): Promise<{ file: string; duratio
   for (const ext of ['', '.json']) {
     const f = model + ext;
     if (!fs.existsSync(f) || fs.statSync(f).size < 100) {
-      const ok = await download(`https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/${vpath}/${voice}.onnx${ext}`, f, 180000);
+      const ok = await downloadFile(`https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/${vpath}/${voice}.onnx${ext}`, f, 240000);
       if (!ok) throw new Error(`could not download the ${voice} voice`);
     }
   }
@@ -1789,29 +1827,29 @@ function startImageGenerator(): Promise<boolean> {
   return imagegenReady;
 }
 
-/** Draws one picture with the local generator. Returns 'ai-clean' (never watermarked) or null. */
-async function aiImage(prompt: string, seed: number, file: string, style = '', mode = ''): Promise<'ai' | 'ai-clean' | null> {
-  if (CFG.offline || !prompt || imagegenDisabled) return null;
-  if (!(await startImageGenerator())) return null;
+/** Draws one picture with Pollinations (free, hosted) — only used when no real picture was found. Returns 'ai-clean' or null. */
+async function aiImage(prompt: string, seed: number, file: string, style = '', _mode = ''): Promise<'ai' | 'ai-clean' | null> {
+  if (CFG.offline || !prompt) return null;
   const size = orientation === 'portrait' ? { w: 864, h: 1536 } : orientation === 'landscape' ? { w: 1536, h: 864 } : { w: 1152, h: 1152 };
-  for (let attempt = 0; attempt < 2; attempt++) {
-    if (imagegenDisabled) return null;
-    try {
-      const res = await fetch(`${IMAGEGEN_BASE}/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: prompt.slice(0, 1200), style, mode, seed: seed % 4294967295, width: size.w, height: size.h, out: file }),
-        signal: AbortSignal.timeout(240000)
-      });
-      const data: any = await res.json().catch(() => ({}));
-      if (res.ok && data?.ok && fs.existsSync(file)) { imagegenCount++; imagegenStreak = 0; return 'ai-clean'; }
-      log(`Image generator: HTTP ${res.status} ${String(data?.error || '').slice(0, 160)}`);
-      if (res.status === 503) await sleep(2000);
-    } catch (err: any) {
-      log(`Image generator request failed (${err?.message}).`);
+  const full = `${prompt}${style ? `, ${style}` : ''}`.slice(0, 900);
+  const q = `prompt=${encodeURIComponent(full)}&w=${size.w}&h=${size.h}&seed=${seed % 1000000}`;
+  const urls = [
+    ...(RELAY.available ? [{ url: `${CFG.appUrl}/api/ai/relay/image?${q}`, headers: { 'X-Animato-Runner-Key': CFG.runnerKey, 'X-Animato-Scope': STUDIO ? `animate:${STUDIO.id}` : `campaign:${CFG.campaignId}` } as Record<string, string> }] : []),
+    { url: `https://image.pollinations.ai/prompt/${encodeURIComponent(full)}?width=${size.w}&height=${size.h}&seed=${seed % 1000000}&model=flux&nologo=true`, headers: {} as Record<string, string> }
+  ];
+  for (const u of urls) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const res = await fetch(u.url, { headers: u.headers, signal: AbortSignal.timeout(80000) });
+        if (res.ok && /^image\//.test(res.headers.get('content-type') || '')) {
+          const buf = Buffer.from(await res.arrayBuffer());
+          if (buf.length > 4000) { fs.writeFileSync(file, buf); return 'ai-clean'; }
+        }
+        log(`Pollinations: HTTP ${res.status}`);
+        if (res.status === 429) await sleep(4000);
+      } catch (err: any) { log(`Pollinations request failed (${err?.message}).`); }
     }
   }
-  if (++imagegenStreak >= 3) { imagegenDisabled = 'it failed 3 times in a row'; log('⚠️ Image generator disabled for the rest of this run (it failed 3 times in a row).'); }
   return null;
 }
 
@@ -2464,7 +2502,8 @@ async function gatherImages(script: Script): Promise<{ files: (string | null)[];
     const pool: WebImage[] = [];
     const briefUrl = forAds && !CFG.adProfile.service ? cleanOfficialUrl((CFG.adBrief.match(/\bhttps?:\/\/[^\s)"'<>]+|\bwww\.[a-z0-9-]+\.[a-z.]{2,}[^\s)"'<>]*/i) || [])[0]) : '';
     // A service has no website to show: never screenshot one for it.
-    const official = forAds && CFG.adProfile.service ? '' : (script.officialUrl || briefUrl);
+    const requestedSite = forAds && STUDIO?.adWebsiteUrl ? cleanOfficialUrl(STUDIO.adWebsiteUrl) : '';
+    const official = forAds && CFG.adProfile.service ? '' : (requestedSite || script.officialUrl || briefUrl);
     /** News / tech: the page the story itself was published on. */
     const storyLink = cleanOfficialUrl(script.sourceStory?.link || '');
     // ---- REAL SCREENSHOTS (everything except stories)
@@ -2641,6 +2680,168 @@ async function gatherImages(script: Script): Promise<{ files: (string | null)[];
 }
 
 // ---------------------------------------------------------------------------
+// 3b. Pexels video clips for stories and ads (blended with the still pictures)
+// ---------------------------------------------------------------------------
+/** Stock footage that fits what the narrator is saying in a scene (Pexels videos API; needs PEXELS_API_KEY). */
+async function pexelsVideos(query: string): Promise<{ id: number; url: string; credit: string; attribution: string; desc: string }[]> {
+  if (!CFG.pexelsKey || !query.trim()) return [];
+  const q = encodeURIComponent(query.trim());
+  const d = await fetchJson(`https://api.pexels.com/videos/search?query=${q}&per_page=8&orientation=${orientation}&size=medium`, { Authorization: CFG.pexelsKey });
+  const out: { id: number; url: string; credit: string; attribution: string; desc: string }[] = [];
+  for (const v of d?.videos || []) {
+    const files = (v.video_files || []).filter((f: any) => f?.link && /mp4/i.test(String(f.file_type || '')) && f.width && f.height);
+    if (!files.length || Number(v.duration) < 3) continue;
+    // About 720 px on the short side is plenty (smaller download, quicker to seek in the renderer).
+    const short = (f: any) => Math.min(f.width, f.height);
+    const best = files.slice().sort((a: any, b: any) => Math.abs(short(a) - 720) - Math.abs(short(b) - 720))[0];
+    out.push({ id: Number(v.id), url: best.link, desc: String(v.url || '').replace(/^.*\/video\//, '').replace(/-\d+\/?$/, '').replace(/[-_/]+/g, ' ').toLowerCase(), credit: `Video: ${String(v.user?.name || 'Pexels').slice(0, 24)} · Pexels`, attribution: `Video by ${v.user?.name || 'unknown'} on Pexels (Pexels License) — ${v.url || 'https://www.pexels.com'}` });
+  }
+  return out;
+}
+
+/** Pixabay footage (second source, used when Pexels has nothing that fits). Needs PIXABAY_API_KEY. */
+async function pixabayVideos(query: string): Promise<{ id: number; url: string; credit: string; attribution: string; desc: string }[]> {
+  if (!CFG.pixabayKey || !query.trim()) return [];
+  const d = await fetchJson(`https://pixabay.com/api/videos/?key=${encodeURIComponent(CFG.pixabayKey)}&q=${encodeURIComponent(query.trim())}&per_page=8&safesearch=true`);
+  const out: { id: number; url: string; credit: string; attribution: string; desc: string }[] = [];
+  for (const v of d?.hits || []) {
+    const f = v?.videos?.medium?.url ? v.videos.medium : v?.videos?.small?.url ? v.videos.small : v?.videos?.large;
+    if (!f?.url || Number(v.duration) < 3) continue;
+    // Offset the id so a Pixabay clip can never collide with a Pexels one in the "already used" set.
+    out.push({ id: 1_000_000_000 + Number(v.id), url: f.url, desc: String(v.tags || '').replace(/[,]+/g, ' ').toLowerCase(), credit: `Video: ${String(v.user || 'Pixabay').slice(0, 24)} · Pixabay`, attribution: `Video by ${v.user || 'unknown'} on Pixabay (Pixabay License) — ${v.pageURL || 'https://pixabay.com'}` });
+  }
+  return out;
+}
+/** Footage for one search phrase, from every source that has a key. */
+async function stockVideos(query: string) {
+  const [a, b] = await Promise.all([pexelsVideos(query).catch(() => []), pixabayVideos(query).catch(() => [])]);
+  const out: typeof a = [];
+  for (let i = 0; i < Math.max(a.length, b.length); i++) { if (a[i]) out.push(a[i]); if (b[i]) out.push(b[i]); }
+  return out;
+}
+
+/**
+ * Does a stock clip fit the scene? Pexels gives the clip's description in its page address and Pixabay gives tags,
+ * so each candidate is scored against what the scene is about (the search words and the narration) and against its
+ * FEELING: a heartbreaking scene never gets people dancing, a joyful one never gets a funeral.
+ */
+const HEAVY_EMO = /^(sad|crying|worried|scared|angry|serious)$/;
+const LIGHT_EMO = /^(happy|excited|laugh)$/;
+const HEAVY_TEXT = /\b(cry|cried|crying|tears?|weep|wept|sob|grief|griev|mourn|funeral|buried|died|death|dead|lost|loss|pain|hurt|heartbr|humiliat|abandon|alone|lonely|afraid|fear|scared|terrif|danger|threat|angry|anger|shout|slap|beat|blood|sick|illness|hospital|accident|betray|cruel|barren|silent|sorrow|regret|worthless|ashamed|shame)\w*/i;
+const LIGHT_TEXT = /\b(laugh|laughter|joy|joyful|happy|happiness|celebrat|party|dance|danced|dancing|wedding|birthday|cheer|smil|giggl|delight|festival|surprise party|triumph|victory)\w*/i;
+const CLASH_FOR_HEAVY = /\b(danc\w*|part(?:y|ies)|celebrat\w*|confetti|festival|club|disco|cheer\w*|laugh\w*|giggl\w*|smil\w*|playful|playing|joy\w*|happy|happiness|fun|wedding|birthday|carnival|fireworks|concert|karaoke|vacation|holiday|comedy|funny|bounc\w*|jump\w*|waving|selfie|thumbs up|toast|champagne|swimming|beach party|sunbathing|cartoon|animation)\b/i;
+const CLASH_FOR_LIGHT = /\b(funeral|grave\w*|cemetery|coffin|crying|cry|tears?|sad|sadness|grief|mourn\w*|depress\w*|lonely|loneliness|storm|war|fight\w*|argu\w*|angry|abuse|accident|crash|disaster|horror|scary|ghost|haunted|zombie|blood|prison|hospital bed)\b/i;
+const FIT_FOR_HEAVY = /\b(sad|cry\w*|tears?|alone|lonely|rain\w*|window|dark|night|dusk|silhouette|pensive|thoughtful|grief|candle|empty|shadow\w*|fog|mist|overcast|lonesome|worried|anxious|hands|praying|prayer|church|hospital|door|walking away)\b/i;
+const FIT_FOR_LIGHT = /\b(smil\w*|happy|laugh\w*|sun\w*|joy\w*|play\w*|celebrat\w*|garden|family|hug\w*|embrac\w*|children|child|kids|baby|warm|golden|bright)\b/i;
+
+function sceneFeeling(emotion: string, narration: string): 'heavy' | 'light' | 'neutral' {
+  const e = String(emotion || '').toLowerCase();
+  if (HEAVY_EMO.test(e)) return 'heavy';
+  if (LIGHT_EMO.test(e)) return 'light';
+  const h = (narration.match(new RegExp(HEAVY_TEXT.source, 'gi')) || []).length, l = (narration.match(new RegExp(LIGHT_TEXT.source, 'gi')) || []).length;
+  return h > l ? 'heavy' : l > h ? 'light' : 'neutral';
+}
+
+/** Lower-cased stems of the meaningful words in a text (4+ letters), for loose matching. */
+function stems(t: string): string[] {
+  const STOP = new Set(['with', 'from', 'that', 'this', 'into', 'over', 'under', 'their', 'there', 'then', 'they', 'were', 'what', 'when', 'where', 'very', 'just', 'once', 'upon', 'time', 'have', 'been', 'would', 'could', 'should', 'about', 'after', 'before', 'while', 'because', 'every', 'never', 'still', 'only', 'even', 'much', 'many', 'some', 'came', 'went', 'said', 'asked', 'told']);
+  return Array.from(new Set(String(t || '').toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter((w) => w.length >= 4 && !STOP.has(w)).map((w) => w.slice(0, 5))));
+}
+
+/** -1 = this clip must not be used for the scene; otherwise a score, higher = fits better. */
+function clipFit(desc: string, scene: { videoQuery: string; narration: string; imagePrompt: string; emotion: string }): number {
+  const d = ` ${desc} `;
+  const feeling = sceneFeeling(scene.emotion, scene.narration);
+  const own = `${scene.narration} ${scene.videoQuery} ${scene.imagePrompt}`;
+  // A feeling word in the clip is fine only when the scene's own words say it too (e.g. a scene that really is about a party).
+  if (feeling === 'heavy' && CLASH_FOR_HEAVY.test(d) && !CLASH_FOR_HEAVY.test(own)) return -1;
+  if (feeling === 'light' && CLASH_FOR_LIGHT.test(d) && !CLASH_FOR_LIGHT.test(own)) return -1;
+  if (feeling === 'neutral' && (CLASH_FOR_HEAVY.test(d) || CLASH_FOR_LIGHT.test(d)) && !CLASH_FOR_HEAVY.test(own) && !CLASH_FOR_LIGHT.test(own)) return -1;
+  const dStems = new Set(stems(d));
+  const q = stems(scene.videoQuery), n = stems(scene.narration);
+  const qHit = q.filter((w) => dStems.has(w)).length, nHit = n.filter((w) => dStems.has(w)).length;
+  let score = qHit * 3 + nHit;
+  if (feeling === 'heavy' && FIT_FOR_HEAVY.test(d)) score += 2;
+  if (feeling === 'light' && FIT_FOR_LIGHT.test(d)) score += 2;
+  return score;
+}
+
+/**
+ * Stories and ads: after the script is written, find a short video clip for most scenes so the picture
+ * moves with the narration. The still image stays as the fallback (and as the poster frame).
+ * Returns one prepared clip (silent, H.264, cropped to the frame) per scene, or null.
+ */
+async function gatherSceneVideos(script: Script, times: { start: number; end: number }[], images: (string | null)[]): Promise<(string | null)[]> {
+  const n = script.scenes.length;
+  const clips: (string | null)[] = new Array(n).fill(null);
+  if (CFG.category !== 'stories' && CFG.category !== 'ads') return clips;
+  if (!CFG.pexelsKey && !CFG.pixabayKey) { log('Scene videos: no Pexels or Pixabay key (PEXELS_API_KEY / PIXABAY_API_KEY) — using pictures only.'); return clips; }
+  // Detect which stock keys actually work (an invalid one is dropped so it never slows the search down).
+  for (const k of ['pexels', 'pixabay'] as const) {
+    const key = k === 'pexels' ? CFG.pexelsKey : CFG.pixabayKey;
+    if (!key) continue;
+    try {
+      const r = await fetch(k === 'pexels' ? 'https://api.pexels.com/videos/search?query=sea&per_page=1' : `https://pixabay.com/api/videos/?key=${encodeURIComponent(key)}&q=sea&per_page=3`, { headers: k === 'pexels' ? { Authorization: key } : {}, signal: AbortSignal.timeout(8000) });
+      if (r.status === 401 || r.status === 403 || (k === 'pixabay' && r.status === 400)) { log(`Scene videos: the ${k} key was rejected (${r.status}) — not using it.`); if (k === 'pexels') CFG.pexelsKey = ''; else CFG.pixabayKey = ''; }
+      else log(`Scene videos: ${k} key found and working.`);
+    } catch { log(`Scene videos: could not check the ${k} key right now — trying it anyway.`); }
+  }
+  if (!CFG.pexelsKey && !CFG.pixabayKey) { log('Scene videos: no working stock key — using pictures only.'); return clips; }
+  const isStory = CFG.category === 'stories';
+  const deadline = Date.now() + (isStory ? 6 : 3) * 60 * 1000;
+  const used = new Set<number>();
+  const attributions: string[] = Array.isArray(script.imageAttributions) ? script.imageAttributions : [];
+  const STOP = new Set(['the', 'and', 'with', 'from', 'that', 'this', 'into', 'over', 'under', 'their', 'there', 'then', 'they', 'was', 'were', 'his', 'her', 'she', 'him', 'for', 'but', 'not', 'all', 'one', 'had', 'has', 'have', 'who', 'what', 'when', 'where', 'very', 'just', 'once', 'upon', 'time']);
+  const kw = (t: string, k: number) => String(t || '').replace(/[^\p{L}\p{N}\s'-]/gu, ' ').split(/\s+/).filter((w) => w.length > 2 && !STOP.has(w.toLowerCase())).slice(0, k).join(' ');
+  const topic = kw((script.title || '').replace(/\s*\(part \d+\)\s*$/i, ''), 4);
+  const cw = Math.round(W * Math.min(1, 720 / Math.min(W, H)) / 2) * 2, ch = Math.round(H * Math.min(1, 720 / Math.min(W, H)) / 2) * 2;
+  // Stories: every scene gets footage that fits what the narrator says, cut together into one moving film.
+  // Ads keep a blend (two of every three scenes are footage, the rest stay pictures).
+  const wanted = script.scenes.map((_, i) => isStory || i % 3 !== 2);
+  const fitOne = async (i: number) => {
+    if (!wanted[i]) return;
+    const s = script.scenes[i];
+    const len = Math.max(1.5, (times[i]?.end ?? 0) - (times[i]?.start ?? 0)) + 0.7;
+    const queries = Array.from(new Set((isStory
+      ? [kw(s.videoQuery || '', 4), kw((s.videoQuery || '').split(/\s+/).slice(0, 2).join(' '), 2), kw(s.searchQuery || '', 4), kw(s.imagePrompt || '', 4)]
+      : [kw(s.searchQuery || '', 4), kw(s.imagePrompt || '', 4), kw(s.narration, 3), topic]).filter(Boolean)));
+    const fitScene = { videoQuery: String(s.videoQuery || s.searchQuery || ''), narration: String(s.narration || '').replace(/\[[^\]]*\]/g, ' '), imagePrompt: String(s.imagePrompt || ''), emotion: String(s.emotion || '') };
+    // The first search words are the most specific; later ones are looser, so they must fit better to be accepted.
+    let qi = 0;
+    for (const query of queries) {
+      if (Date.now() > deadline) return;
+      const need = qi++ === 0 ? 3 : 4;
+      const ranked = (await stockVideos(query)).filter((v) => !used.has(v.id))
+        .map((v) => ({ v, score: clipFit(v.desc, fitScene) })).filter((x) => x.score >= need).sort((a, b) => b.score - a.score);
+      for (const { v } of ranked.slice(0, isStory ? 4 : 3)) {
+        const raw = path.join(WORK_DIR, `scene_${i}_raw.mp4`), clip = path.join(WORK_DIR, `scene_${i}.mp4`);
+        if (!(await download(v.url, raw, 60000))) continue;
+        const r = await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-stream_loop', '-1', '-i', raw, '-t', len.toFixed(2),
+          '-vf', `scale=${cw}:${ch}:force_original_aspect_ratio=increase,crop=${cw}:${ch},fps=${FPS},setsar=1`,
+          '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '27', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', clip], { timeoutMs: 120000 });
+        try { fs.rmSync(raw, { force: true }); } catch {}
+        if (r.code !== 0 || !fs.existsSync(clip) || (await probeDuration(clip)) < 1) continue;
+        used.add(v.id);
+        clips[i] = clip;
+        // No usable still for this scene? The clip's first frame becomes the picture (and the fallback).
+        if (!images[i]) {
+          const jpg = path.join(WORK_DIR, `scene_${i}.jpg`);
+          if (await toJpeg(clip, jpg)) images[i] = jpg;
+        }
+        if (!attributions.includes(v.attribution)) attributions.push(v.attribution);
+        return;
+      }
+    }
+  };
+  let done = 0;
+  const queue = script.scenes.map((_, i) => i);
+  await Promise.all(Array.from({ length: 3 }, async () => { while (queue.length) { await fitOne(queue.shift()!); done++; } }));
+  script.imageAttributions = attributions;
+  log(`Scene videos: ${clips.filter(Boolean).length} clip(s) that fit the story found for ${n} scenes (${done} searched) — scenes with no clip that fits the words and the feeling keep their picture.`);
+  return clips;
+}
+
+// ---------------------------------------------------------------------------
 // 4. Character rig from the app (the character designed in the editor)
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -2712,9 +2913,11 @@ const MUSIC_PAUSE_LIFT_DB = 6;
 async function findMusic(seconds: number, narration: Narration): Promise<string | null> {
   try {
     const mood = moodFor(CFG.category, CFG.subGenre);
-    const file = path.join(WORK_DIR, `music_${mood}.wav`);
+    const uniqueMusicId = STUDIO?.id || CFG.runId || `${CFG.campaignId}:${CFG.partNumber}:${Date.now()}`;
+    const file = path.join(WORK_DIR, `music_${mood}_${String(uniqueMusicId).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 32)}.wav`);
     const t0 = Date.now();
-    const { L, R, sampleRate } = composeBuffers(mood, Math.max(10, seconds), `${CFG.campaignId}:${CFG.partNumber}`);
+    // The soundtrack is procedurally composed per video, with a unique seed; it isn't one cached generic loop.
+    const { L, R, sampleRate } = composeBuffers(mood, Math.max(10, seconds), `${uniqueMusicId}:${CFG.partNumber}:${Math.random().toString(36).slice(2)}`);
     eqForVoice(L, R, sampleRate);
     const voice = await analyseVoice(narration.audioPath);
     const speech = voice?.speech?.length ? voice.speech : narration.words.map((w) => ({ start: w.start, end: w.end }));
@@ -2738,6 +2941,8 @@ async function findMusic(seconds: number, narration: Narration): Promise<string 
 
 /** Audio: narration + the music bed (already levelled under the voice). */
 function audioArgs(narration: string, music: string | null, firstInput: number): { inputs: string[]; filter: string } {
+  // Only a real file path counts as music (an empty list/blank string would hand ffmpeg a blank input).
+  if (typeof music !== 'string' || !music || !fs.existsSync(music)) music = null;
   const inputs = ['-i', narration];
   if (music) inputs.push('-stream_loop', '-1', '-i', music);
   const v = firstInput, m = firstInput + 1;
@@ -2750,18 +2955,20 @@ function audioArgs(narration: string, music: string | null, firstInput: number):
 
 async function renderWithStage(opts: {
   narration: Narration; scenes: Scene[]; times: { start: number; end: number }[]; cues: { t: number; tag: string }[]; images: (string | null)[];
-  title: string; badge: string; endCard: string; music: string | null; duration: number; credits?: (string | null)[]; musicalStage?: boolean; chorusIntervals?: { start: number; end: number }[];
+  title: string; badge: string; endCard: string; music: string | null; duration: number; credits?: (string | null)[]; videos?: (string | null)[]; musicalStage?: boolean; chorusIntervals?: { start: number; end: number }[];
   /** Override the canvas the stage renders at (used for ads that render landscape then get framed into a Short — see adLandscapeShort). Defaults to the job's actual frame. */
   size?: { w: number; h: number };
-  musical?: { stageId?: number; stageAutoSeed?: string; style?: string; sections?: { start: number; end: number; tag: string; emotion?: string }[]; vocalSpans?: { start: number; end: number }[]; drumLevel?: number; keysLevel?: number };
+  musical?: { mood?: string; stageId?: number; stageAutoSeed?: string; style?: string; sections?: { start: number; end: number; tag: string; emotion?: string }[]; vocalSpans?: { start: number; end: number }[]; drumLevel?: number; keysLevel?: number };
   stems?: Stems;
   lyrics?: { lines: { text: string; en: string }[]; noSpaces: boolean };
 }): Promise<{ ok: boolean; character: string; reason?: string }> {
   const audioExt = path.extname(opts.narration.audioPath) || '.mp3';
   const accent = CFG.category === 'cooking' ? '#FFB020' : CFG.category === 'tech' ? '#22D3EE' : CFG.category === 'news' ? '#FF4D4D' : '#FFD23F';
   // Musicals (a full concert, every frame) render at 75% size and are upscaled — about twice as fast.
-  const fast = !!opts.musicalStage && !opts.size && W * H > 1280 * 720;
-  const drawSize = fast ? { w: Math.round(W * 0.75 / 2) * 2, h: Math.round(H * 0.75 / 2) * 2 } : opts.size;
+  // Studio videos are drawn at 60-75% size and upscaled: far fewer pixels to draw and move for every frame.
+  const drawScale = STUDIO ? (STUDIO.fast ? 0.75 : 0.6) : 0.75;
+  const fast = !!opts.musicalStage && !opts.size && (!!STUDIO || W * H > 1280 * 720);
+  const drawSize = fast ? { w: Math.round(W * drawScale / 2) * 2, h: Math.round(H * drawScale / 2) * 2 } : opts.size;
   const RW = drawSize?.w || W, RH = drawSize?.h || H;
   const job = {
     width: RW, height: RH, fps: FPS, duration: opts.duration, category: CFG.category,
@@ -2770,7 +2977,7 @@ async function renderWithStage(opts: {
     words: opts.narration.words.map((w) => ({ text: w.text, start: +w.start.toFixed(3), end: +w.end.toFixed(3), ...(typeof w.line === 'number' ? { line: w.line } : {}) })),
     ...(opts.lyrics ? { lyrics: opts.lyrics } : {}),
     wordsReliable: opts.narration.wordsReliable,
-    segments: opts.scenes.map((s, i) => ({ start: opts.times[i].start, end: opts.times[i].end, text: s.narration, image: opts.images[i] ? `/img/${path.basename(opts.images[i]!)}` : null, shot: s.shot, emotion: s.emotion, credit: opts.credits?.[i] || null })),
+    segments: opts.scenes.map((s, i) => ({ start: opts.times[i].start, end: opts.times[i].end, text: s.narration, image: opts.images[i] ? `/img/${path.basename(opts.images[i]!)}` : null, ...(opts.videos?.[i] ? { video: `/vid/${path.basename(opts.videos[i]!)}` } : {}), shot: s.shot, emotion: s.emotion, credit: opts.credits?.[i] || null })),
     cues: opts.cues,
     musicalStage: !!opts.musicalStage,
     chorusIntervals: opts.chorusIntervals || [],
@@ -2828,7 +3035,7 @@ async function runStage(opts: { stageFile: string; job: any; duration: number; a
   const ffDone = new Promise<number>((resolve) => ff.on('close', (code: number | null) => resolve(code ?? -1)));
   ff.stdin.on('error', () => {});
 
-  const types: Record<string, string> = { '.html': 'text/html', '.js': 'text/javascript', '.json': 'application/json', '.jpg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.svg': 'image/svg+xml', '.gif': 'image/gif', '.ttf': 'font/ttf', '.mp3': 'audio/mpeg', '.wav': 'audio/wav' };
+  const types: Record<string, string> = { '.mp4': 'video/mp4', '.html': 'text/html', '.js': 'text/javascript', '.json': 'application/json', '.jpg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.svg': 'image/svg+xml', '.gif': 'image/gif', '.ttf': 'font/ttf', '.mp3': 'audio/mpeg', '.wav': 'audio/wav' };
   const serveFile = (res: any, file: string) => {
     if (!fs.existsSync(file)) { res.writeHead(404); res.end(); return; }
     res.writeHead(200, { 'Content-Type': types[path.extname(file).toLowerCase()] || 'application/octet-stream', 'Cache-Control': 'no-store' });
@@ -2849,7 +3056,7 @@ async function runStage(opts: { stageFile: string; job: any; duration: number; a
       if (p === '/stage.js') return serveFile(res, stageJs);
       if (p === '/job.json') { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(job)); return; }
       if (p === '/font/Poppins-Bold.ttf') return serveFile(res, path.join(HERE, 'assets/fonts/Poppins-Bold.ttf'));
-      if (p.startsWith('/img/')) return serveFile(res, path.join(WORK_DIR, path.basename(p)));
+      if (p.startsWith('/img/') || p.startsWith('/vid/')) return serveFile(res, path.join(WORK_DIR, path.basename(p)));
       if (opts.files[p]) return serveFile(res, opts.files[p]);
       res.writeHead(404); res.end(); return;
     }
@@ -3346,6 +3553,43 @@ interface MusicalSong {
   hashtags: string[];
   tags: string[];
 }
+/**
+ * The feeling of the song the person picked (happy, sad, emotional…). It decides the singer's and the band's faces
+ * for every part of the song, the lyrics' and the music's feeling, and (in the stage) the lighting and atmosphere.
+ * Not chosen (automations) = the old behaviour.
+ */
+interface SongMoodSpec {
+  /** Emotion tag for intro / verse / pre-chorus, for chorus (and bridge), for the LAST chorus, and for the outro. */
+  verse: string; chorus: string; finalChorus?: string; outro: string;
+  /** Written into the lyric-writing prompt. */
+  brief: string;
+  /** Written into the music engine's prompt, and whether it replaces the genre's own (often upbeat) tags. */
+  tags: string; vocal: string; replaceGenre: boolean; bpm?: [number, number]; minorKeys?: string[];
+}
+const SONG_MOODS: Record<string, SongMoodSpec> = {
+  happy: { verse: 'happy', chorus: 'excited', outro: 'happy', brief: 'joyful, bright, celebratory and uplifting — smiling, feel-good lyrics', tags: 'happy, joyful, bright major key, uplifting, feel-good', vocal: 'bright, smiling, joyful vocal', replaceGenre: false },
+  sad: { verse: 'sad', chorus: 'sad', finalChorus: 'crying', outro: 'sad', brief: 'SAD and heartbreaking — loss, longing, goodbye or regret. The words, the story and the feeling must all be sorrowful. Nothing cheerful, no party or celebration lines, no happy ending', tags: 'sad emotional ballad, slow tempo, minor key, melancholic, heartbreaking, sparse piano, sorrowful strings, wide reverb', vocal: 'breathy, vulnerable, tearful vocal with a crack of pain', replaceGenre: true, bpm: [62, 76], minorKeys: ['A minor', 'D minor', 'E minor', 'F# minor'] },
+  emotional: { verse: 'worried', chorus: 'sad', outro: 'calm', brief: 'deeply EMOTIONAL and touching — heartfelt, tender, vulnerable and moving, with real feeling in every line (bittersweet, not cheerful)', tags: 'emotional heartfelt ballad, tender, touching, slow build, piano and strings, soft dynamics rising to a powerful chorus', vocal: 'tender, heartfelt, moved vocal with long held notes', replaceGenre: true, bpm: [66, 82], minorKeys: ['A minor', 'D minor', 'Bb major', 'F major'] },
+  romantic: { verse: 'calm', chorus: 'happy', outro: 'calm', brief: 'ROMANTIC and loving — warm, intimate, tender love lyrics', tags: 'romantic love song, warm, intimate, smooth, lush chords, soft groove', vocal: 'warm, loving, intimate vocal', replaceGenre: false, bpm: [70, 92] },
+  energetic: { verse: 'excited', chorus: 'excited', outro: 'happy', brief: 'HIGH-ENERGY, party and hype — confident, loud, fun and full of movement', tags: 'high energy, party, hype, driving beat, big chorus, powerful', vocal: 'energetic, punchy, hyped vocal', replaceGenre: false },
+  angry: { verse: 'serious', chorus: 'angry', outro: 'serious', brief: 'ANGRY and intense — defiance, frustration, power, raw confrontation', tags: 'aggressive, intense, dark, hard-hitting drums, driving bass, defiant', vocal: 'raw, fierce, intense vocal', replaceGenre: false },
+  hopeful: { verse: 'calm', chorus: 'happy', outro: 'happy', brief: 'HOPEFUL and inspiring — rising from hardship, faith, light after darkness', tags: 'hopeful, inspiring, uplifting, warm, building to a soaring chorus', vocal: 'warm, sincere, uplifted vocal', replaceGenre: false },
+  peaceful: { verse: 'calm', chorus: 'calm', outro: 'calm', brief: 'PEACEFUL and calm — gentle, soothing, serene lyrics', tags: 'peaceful, calm, gentle, soft acoustic textures, soothing, spacious', vocal: 'soft, serene, gentle vocal', replaceGenre: true, bpm: [64, 84] },
+};
+/** The chosen song mood id, or '' when the person did not choose one. */
+function songMood(): string {
+  const id = String(STUDIO?.mood || (typeof JOB !== 'undefined' ? (JOB as any).song_mood : '') || '').toLowerCase().replace(/[^a-z]/g, '');
+  return SONG_MOODS[id] ? id : '';
+}
+/** The face/emotion for a song part under the chosen mood (null = not chosen: keep the part's own emotion). */
+function moodSectionEmotion(tag: string, chorusNo: number, chorusCount: number): string | null {
+  const m = SONG_MOODS[songMood()];
+  if (!m) return null;
+  if (tag === 'chorus') return chorusNo === chorusCount && m.finalChorus ? m.finalChorus : m.chorus;
+  if (tag === 'bridge') return m.chorus;
+  if (tag === 'outro') return m.outro;
+  return m.verse;
+}
 const MUSICAL_PROFILES: Record<string, { style: string; emotion: string; instruments: string }> = {
   'sad / heartbreak': { style: 'cinematic emotional pop ballad, intimate lead vocal, piano, warm strings, restrained drums, spacious reverb', emotion: 'sad', instruments: 'piano and cinematic strings' },
   'happy / feel-good': { style: 'bright uplifting pop, catchy melodic hook, warm live drums, guitars, handclaps, polished radio mix', emotion: 'happy', instruments: 'bright guitars, handclaps and live drums' },
@@ -3389,6 +3633,19 @@ const GENRE_FEEL: Record<string, { bpm: [number, number]; keys: string[]; tags: 
 };
 /** This video's tempo / key / production for the genre (stable per video, varied between videos). */
 function genreFeel(): { bpm: number; key: string; tags: string; vocal: string } {
+  const base = genreFeelBase(), m = SONG_MOODS[songMood()];
+  if (!m) return base;
+  const n = parseInt(crypto.createHash('md5').update(`${CFG.campaignId || CFG.campaignName}:${CFG.partNumber}:moodfeel`).digest('hex').slice(0, 8), 16);
+  const genreName = String(CFG.subGenre || '').trim();
+  return {
+    bpm: m.bpm ? m.bpm[0] + (n % (m.bpm[1] - m.bpm[0] + 1)) : base.bpm,
+    key: m.minorKeys ? m.minorKeys[Math.floor(n / 7) % m.minorKeys.length] : base.key,
+    // A sad song keeps the genre's flavour but not its party tempo and bounce.
+    tags: m.replaceGenre ? `${m.tags}${genreName ? `, ${genreName} influences` : ''}` : `${m.tags}, ${base.tags}`,
+    vocal: m.replaceGenre ? m.vocal : `${m.vocal}, ${base.vocal}`,
+  };
+}
+function genreFeelBase(): { bpm: number; key: string; tags: string; vocal: string } {
   const k = String(CFG.subGenre || '').trim().toLowerCase();
   const g = GENRE_FEEL[k];
   const n = parseInt(crypto.createHash('md5').update(`${CFG.campaignId || CFG.campaignName}:${CFG.partNumber}:feel`).digest('hex').slice(0, 8), 16);
@@ -3396,6 +3653,12 @@ function genreFeel(): { bpm: number; key: string; tags: string; vocal: string } 
   return { bpm: g.bpm[0] + (n % (g.bpm[1] - g.bpm[0] + 1)), key: g.keys[Math.floor(n / 7) % g.keys.length], tags: g.tags, vocal: g.vocal };
 }
 function musicalProfile(): { style: string; emotion: string; instruments: string } {
+  const p = musicalProfileBase(), mood = songMood();
+  if (!mood) return p;
+  // The person's chosen feeling wins over what the genre usually feels like.
+  return { ...p, emotion: mood === 'sad' ? 'sad' : mood === 'emotional' ? 'emotional and tender' : mood === 'angry' ? 'angry' : mood === 'peaceful' ? 'calm' : SONG_MOODS[mood].chorus };
+}
+function musicalProfileBase(): { style: string; emotion: string; instruments: string } {
   const k = String(CFG.subGenre || '').trim().toLowerCase();
   if (MUSICAL_PROFILES[k]) return MUSICAL_PROFILES[k];
   // A custom genre typed in the app: use it as the direction itself.
@@ -3539,6 +3802,65 @@ Make it a song people replay: (1) the hook is short, punchy and instantly memora
   return null;
 }
 async function writeMusicalSong(pastTitles: string[]): Promise<MusicalSong> {
+  const manual = cleanMusicLyrics(String(CFG.musicalLyrics || '').slice(0, 3000));
+  if (manual) {
+    const aliases: Record<string, string> = { intro: 'intro', verse: 'verse', 'verse 1': 'verse', 'verse 2': 'verse', prechorus: 'prechorus', 'pre-chorus': 'prechorus', chorus: 'chorus', hook: 'chorus', bridge: 'bridge', outro: 'outro' };
+    const sections: MusicalSection[] = [];
+    let current: MusicalSection | null = null;
+    let sawSectionHeader = false;
+    for (const line of manual.split(/\n/)) {
+      const head = line.trim().match(/^\[?([a-z -]+(?: \d+)?)\]?:?$/i);
+      const tag = head ? aliases[head[1].trim().toLowerCase()] : null;
+      if (tag) { sawSectionHeader = true; current = { tag, lyrics: '', emotion: tag === 'chorus' ? 'excited' : 'calm' }; sections.push(current); continue; }
+      if (!current) { current = { tag: 'verse', lyrics: '', emotion: 'calm' }; sections.push(current); }
+      if (line.trim()) current.lyrics += `${current.lyrics ? '\n' : ''}${line.trim()}`;
+    }
+    let arranged = sections.filter((s) => s.lyrics.trim()).map((s) => ({ ...s, lyrics: s.lyrics.trim() }));
+    const lines = manual.split(/\n+/).map((s) => s.trim()).filter(Boolean);
+    if (!arranged.length || !arranged.some((s) => s.tag === 'chorus')) {
+      // No section labels: turn the paste into a short intro/verse/hook/outro arrangement.
+      if (!sawSectionHeader) {
+        const intro = lines.slice(0, 2).join('\n');
+        const verse = lines.slice(2, Math.max(3, lines.length - 2)).join('\n');
+        const outro = lines.length > 4 ? lines.slice(-2).join('\n') : '';
+        arranged = [];
+        if (intro) arranged.push({ tag: 'intro', lyrics: intro, emotion: 'calm' });
+        if (verse) arranged.push({ tag: 'verse', lyrics: verse, emotion: 'calm' });
+        const hook = lines[Math.min(lines.length - 1, Math.max(0, Math.floor(lines.length / 2)))] || lines[0] || 'Sing it again';
+        const second = lines.find((x) => x !== hook) || hook;
+        arranged.push({ tag: 'chorus', lyrics: `${hook}\n${second}`, emotion: 'excited' });
+        if (outro) arranged.push({ tag: 'outro', lyrics: outro, emotion: 'happy' });
+      } else {
+        // Explicit sections without a chorus: use the strongest middle line as the refrain.
+        const refrain = lines[Math.min(lines.length - 1, Math.floor(lines.length / 2))] || lines[0] || 'Sing it again';
+        arranged.splice(Math.min(1, arranged.length), 0, { tag: 'chorus', lyrics: `${refrain}\n${refrain}`, emotion: 'excited' });
+      }
+    }
+    // Fit an approximately one-minute cut by prioritizing the chorus/hook, then intro/outro.
+    const wordCount = (s: string) => s.split(/\s+/).filter(Boolean).length;
+    const budget = 58; let used = 0;
+    const chorus = arranged.find((s) => s.tag === 'chorus');
+    const intro = arranged.find((s) => s.tag === 'intro');
+    const outro = arranged.find((s) => s.tag === 'outro');
+    const priority = [chorus, intro, outro, ...arranged.filter((s) => s !== chorus && s !== intro && s !== outro)].filter(Boolean) as MusicalSection[];
+    for (const sec of priority) {
+      const kept: string[] = [];
+      for (const line of sec.lyrics.split(/\n+/).map((x) => x.trim()).filter(Boolean)) {
+        const words = wordCount(line);
+        if (used + words <= budget) { kept.push(line); used += words; }
+      }
+      sec.lyrics = kept.join('\n');
+    }
+    arranged = arranged.filter((s) => s.lyrics.trim());
+    if (!arranged.some((s) => s.tag === 'chorus')) arranged.push({ tag: 'chorus', lyrics: (arranged[0]?.lyrics.split(/\n/)[0] || 'Sing it again'), emotion: 'excited' });
+    const repeated: MusicalSection[] = arranged.flatMap((s) => s.tag === 'chorus' ? [s, { ...s, emotion: s.emotion || 'excited' }] : [s]);
+    const lyrics = cleanMusicLyrics(sectionLyricText(repeated));
+    const firstLine = lines.find((x) => x && !/^\[/.test(x)) || 'Original song';
+    const title = String(firstLine.replace(/^[^:]{1,24}:\s*/, '').replace(/[.!?].*$/, '')).replace(/\s+/g, ' ').trim().slice(0, 70) || 'Original song';
+    const gender = CFG.gender === 'male' ? 'male' : 'female';
+    const style = String(CFG.subGenre || 'original music');
+    return { title, description: `Original ${style} music video performed by a ${gender} lead singer.`, lyrics, sections: repeated, hashtags: musicHashtags(style), tags: ['original music', style, 'music video'] };
+  }
   const profile = musicalProfile();
   const gender = CFG.gender === 'male' ? 'male' : 'female';
   const already = pastTitles.slice(-20).join(' | ');
@@ -3546,7 +3868,7 @@ async function writeMusicalSong(pastTitles: string[]): Promise<MusicalSong> {
   const idea = songConcept();
   log(`🎵 Song idea (${idea.theme}): ${idea.concept}`);
   const meaning = `WHAT THE SONG IS ABOUT (mandatory): ${idea.concept}. Tell THIS story from the singer’s point of view. Every single line must belong to it — concrete people, places, objects and actions (a named street, mama’s kitchen, the bus stop, the DJ booth, a phone screen…), one clear emotion, and a message a listener can repeat in one sentence. No vague filler about “good vibes”, “just the good”, “feeling good tonight” with nothing behind it; at most one short ad-lib (e.g. “eh!”) per section. `;
-  const user = `${meaning}Write one completely ORIGINAL ${IS_SHORTS ? 'short-form' : 'full-length'} song for a music video. LANGUAGE: write the title and ALL the lyrics in ${lang.name}${lang.name.toLowerCase() === 'english' ? '' : ` (natural, idiomatic ${lang.name} as native songwriters write it — not a translation; the description and tags may be in English)`}. Lead vocalist gender: ${gender}. Style/mood: ${CFG.subGenre || 'cinematic pop'}. Musical direction: ${profile.style}. Emotional performance must fit the style. The lyrics must be clean, singable, coherent and specific, with natural rhymes and a memorable chorus. ${CFG.musicSeconds <= 40 ? `The song is ONLY ${CFG.musicSeconds} SECONDS long, so every line must count. Use exactly this structure: INTRO (2 short lines that set the scene of the story — who, where, what just happened — so the listener is hooked and knows what the song is about), CHORUS (4 short, very catchy lines: the HOOK is one short memorable phrase (2–5 words) that states the song’s message, sung in line 1 and again in line 3 or 4; lines 2 and 4 add the feeling/detail and rhyme; this is most of the song), OUTRO (2 lines that land the story — a payoff, a twist or a punchline that answers the intro — ending on the hook). No verses, no bridge. Also return "hook" (the hook phrase) and "message" (the song’s point in one English sentence).` : CFG.musicSeconds <= 75 ? `The song is about ${CFG.musicSeconds} SECONDS long and must feel like a real hit single cut down to one minute, with a complete song structure. Write exactly five sections, in this order: INTRO (2 short lines — a call-out or vocal hook that sets the mood and hints at the story), VERSE (4 short lines that tell the story with concrete detail — who, where, what happened; natural rhymes), PRE-CHORUS (tag "prechorus": 2 short lines that lift the energy and build anticipation — a rising question, promise or turn — so the chorus explodes), CHORUS (4 short, very catchy lines: the HOOK is one short memorable phrase (2–5 words) that states the song’s message, sung in line 1 and repeated in line 3 or 4; lines 2 and 4 add the feeling and rhyme; simple, singable, built for people to sing along — the emotional release of the verse), OUTRO (2 lines that land the story — a payoff or twist — ending on the hook). Keep every line short (4–8 words) so it fits the beat. The CHORUS will be sung TWICE back to back. The emotion, rhythm and slang of every line must match the genre: ${(() => { const f = genreFeel(); return `${f.tags}; vocal: ${f.vocal}${f.bpm ? `; about ${f.bpm} BPM` : ''}`; })()}. Also return "hook" (the hook phrase) and "message" (the song’s point in one English sentence).` : 'Use this structure when it helps: intro, verse, pre-chorus, chorus, verse 2, pre-chorus, chorus, bridge, final chorus, outro.'} The chorus must be strong enough for a choir to answer behind the lead. Do not quote, adapt, imitate or reuse any copyrighted lyrics or named artist/song. Return JSON only with title, description, lyrics, sections (array of {tag,lyrics,emotion}), hashtags, tags. ${CFG.musicSeconds <= 75 ? `Use about ${Math.round(CFG.musicSeconds * 0.95)}–${Math.round(CFG.musicSeconds * 1.25)} lyric words in total across intro + verse + pre-chorus + chorus + outro (the chorus repeats, so the sung total is higher).` : `Aim for at least ${IS_SHORTS ? 90 : 220} lyric words.`} Previous titles to avoid repeating: ${already || '(none)'}${CFG.performanceNotes ? `\n\nWHAT IS WORKING ON THIS CHANNEL (learn from it — the mood, hook style and subjects of the best songs):\n${CFG.performanceNotes}` : ''}`;
+  const user = `${meaning}Write one completely ORIGINAL ${IS_SHORTS ? 'short-form' : 'full-length'} song for a music video. LANGUAGE: write the title and ALL the lyrics in ${lang.name}${lang.name.toLowerCase() === 'english' ? '' : ` (natural, idiomatic ${lang.name} as native songwriters write it — not a translation; the description and tags may be in English)`}. Lead vocalist gender: ${gender}. Style/mood: ${CFG.subGenre || 'cinematic pop'}.${SONG_MOODS[songMood()] ? ` THE FEELING OF THE SONG (mandatory, overrides the style's usual mood): ${SONG_MOODS[songMood()].brief}.` : ''} Musical direction: ${profile.style}. Emotional performance must fit the style. The lyrics must be clean, singable, coherent and specific, with natural rhymes and a memorable chorus. ${CFG.musicSeconds <= 40 ? `The song is ONLY ${CFG.musicSeconds} SECONDS long, so every line must count. Use exactly this structure: INTRO (2 short lines that set the scene of the story — who, where, what just happened — so the listener is hooked and knows what the song is about), CHORUS (4 short, very catchy lines: the HOOK is one short memorable phrase (2–5 words) that states the song’s message, sung in line 1 and again in line 3 or 4; lines 2 and 4 add the feeling/detail and rhyme; this is most of the song), OUTRO (2 lines that land the story — a payoff, a twist or a punchline that answers the intro — ending on the hook). No verses, no bridge. Also return "hook" (the hook phrase) and "message" (the song’s point in one English sentence).` : CFG.musicSeconds <= 75 ? `The song is about ${CFG.musicSeconds} SECONDS long and must feel like a real hit single cut down to one minute, with a complete song structure. Write exactly five sections, in this order: INTRO (2 short lines — a call-out or vocal hook that sets the mood and hints at the story), VERSE (4 short lines that tell the story with concrete detail — who, where, what happened; natural rhymes), PRE-CHORUS (tag "prechorus": 2 short lines that lift the energy and build anticipation — a rising question, promise or turn — so the chorus explodes), CHORUS (4 short, very catchy lines: the HOOK is one short memorable phrase (2–5 words) that states the song’s message, sung in line 1 and repeated in line 3 or 4; lines 2 and 4 add the feeling and rhyme; simple, singable, built for people to sing along — the emotional release of the verse), OUTRO (2 lines that land the story — a payoff or twist — ending on the hook). Keep every line short (4–8 words) so it fits the beat. The CHORUS will be sung TWICE back to back. The emotion, rhythm and slang of every line must match the genre: ${(() => { const f = genreFeel(); return `${f.tags}; vocal: ${f.vocal}${f.bpm ? `; about ${f.bpm} BPM` : ''}`; })()}. Also return "hook" (the hook phrase) and "message" (the song’s point in one English sentence).` : 'Use this structure when it helps: intro, verse, pre-chorus, chorus, verse 2, pre-chorus, chorus, bridge, final chorus, outro.'} The chorus must be strong enough for a choir to answer behind the lead. Do not quote, adapt, imitate or reuse any copyrighted lyrics or named artist/song. Return JSON only with title, description, lyrics, sections (array of {tag,lyrics,emotion}), hashtags, tags. ${CFG.musicSeconds <= 75 ? `Use about ${Math.round(CFG.musicSeconds * 0.95)}–${Math.round(CFG.musicSeconds * 1.25)} lyric words in total across intro + verse + pre-chorus + chorus + outro (the chorus repeats, so the sung total is higher).` : `Aim for at least ${IS_SHORTS ? 90 : 220} lyric words.`} Previous titles to avoid repeating: ${already || '(none)'}${CFG.performanceNotes ? `\n\nWHAT IS WORKING ON THIS CHANNEL (learn from it — the mood, hook style and subjects of the best songs):\n${CFG.performanceNotes}` : ''}`;
   let last = '', fillerRejects = 0;
   for await (const a of LLM.attempts({
     system: 'You are a hit songwriter (think chart-topping Afrobeats/pop writers) and music-video creative director. A great short song tells one specific, relatable story with a hook people sing after one listen. Create original lyrics only. Never provide copyrighted lyrics. Make section labels and emotions explicit so a timed video renderer can stage the performance.',
@@ -3600,111 +3922,35 @@ const mmss = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor((ms 
 /** Shows what ACE-Step is doing on the automation card, so a slow song never looks frozen. */
 async function aceStatus(what: string) {
   const el = Date.now() - aceStarted;
-  try { await reportStatus('running', `2/6 Generating music (ACE-Step on the runner) · ${mmss(el)} of max ${CFG.acestepLocalMin}:00`, Math.min(40, 24 + Math.round((el / (CFG.acestepLocalMin * 60000)) * 16)), `🎵 ${what} (${mmss(el)} elapsed)`); } catch {}
+  try { await reportStatus('running', `2/6 Generating music (ACE Music cloud) · ${mmss(el)}`, Math.min(40, 24 + Math.round((el / (CFG.acestepLocalMin * 60000)) * 16)), `🎵 ${what} (${mmss(el)} elapsed)`); } catch {}
 }
 const aceLeft = () => Math.max(0, aceDeadline - Date.now());
-/**
- * ACE-Step everywhere: the hosted API first; when it is down / overloaded (Cloudflare 504s), the SAME
- * open-source model runs on the GitHub runner's CPU (installed in the background while the hosted API
- * is tried, and cached between runs), through ACE-Step's own REST server (/release_task → /query_result).
- */
-let aceLocalRun = false;
-/** ACE-Step runs ONLY on the GitHub runner (no online API): installed once, cached between runs. */
+/** ACE Music cloud (api.acemusic.ai), keys rotated: a key that is rate-limited, out of quota or invalid is skipped. */
+async function aceKeys(): Promise<string[]> {
+  const local = splitKeys(ENV.ACE_MUSIC_API_KEYS);
+  if (local.length) return local;
+  if (RELAY.available) return RELAY.musicKeys();
+  return [];
+}
 async function generateAceStepMusic(song: MusicalSong): Promise<{ file: string; duration: number; taskId?: string }> {
-  return aceLocalGenerate(song, prepareLocalAce());
-}
-let aceLocalPrep: Promise<{ base: string; stop: () => void; lm: boolean }> | null = null;
-let aceLocalWantLm = true;
-/** The local server's own key (sent as both the Bearer header and ai_token, which it checks). */
-const ACE_LOCAL_KEY = `animato-${crypto.randomBytes(8).toString('hex')}`;
-function prepareLocalAce(): Promise<{ base: string; stop: () => void; lm: boolean }> {
-  if (aceLocalPrep) return aceLocalPrep;
-  aceLocalPrep = (async () => {
-    const t0 = Date.now();
-    const root = path.join(os.homedir(), 'acestep-local'), repo = path.join(root, 'repo'), venv = path.join(root, 'venv'), py = path.join(venv, 'bin', 'python');
-    const ckpt = path.join(repo, 'checkpoints');
-    const script = `set -e
-mkdir -p "${root}"
-if [ ! -d "${repo}/acestep" ]; then git clone --depth 1 https://github.com/ace-step/ACE-Step-1.5.git "${repo}"; fi
-if [ ! -x "${py}" ]; then python3 -m venv "${venv}"; fi
-if ! "${py}" -c "import acestep, torch, diffusers, transformers" 2>/dev/null; then
-  "${py}" -m pip install -q --disable-pip-version-check --upgrade pip
-  "${py}" -m pip install -q --disable-pip-version-check torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cpu
-  "${py}" -m pip install -q --disable-pip-version-check "transformers>=4.51.0,<4.58.0" "diffusers>=0.37.0" "matplotlib>=3.7.5" "scipy>=1.10.1" "soundfile>=0.13.1" "loguru>=0.7.3" "einops>=0.8.1" "accelerate>=1.12.0" "fastapi>=0.110.0" diskcache "uvicorn[standard]>=0.27.0" "numba>=0.63.1" "vector-quantize-pytorch>=1.27.15" "torchao>=0.16.0,<0.17.0" toml "peft>=0.18.0" lycoris-lora modelscope "typer-slim>=0.21.1" "pytorch-wavelets>=1.3.0" "pywavelets>=1.9.0" "setuptools<72" huggingface_hub "gradio==6.2.0" "lightning>=2.0.0" "tensorboard>=2.20.0"
-  "${py}" -m pip install -q --disable-pip-version-check --no-deps -e "${repo}"
-fi
-# Only what text-to-music needs (turbo DiT, VAE, text encoder) — not the 1.7B planning LM.
-if [ ! -d "${ckpt}/acestep-v15-turbo" ] || [ ! -d "${ckpt}/vae" ] || [ ! -d "${ckpt}/Qwen3-Embedding-0.6B" ]; then
-  "${py}" -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/Ace-Step1.5', local_dir='${ckpt}', allow_patterns=['acestep-v15-turbo/*','vae/*','Qwen3-Embedding-0.6B/*','*.json','*.txt'])"
-fi
-# The small planning LM ("thinking": plans the song's sections and melody before the music is made).
-if [ ! -d "${ckpt}/acestep-5Hz-lm-0.6B" ]; then
-  "${py}" -c "from huggingface_hub import snapshot_download; snapshot_download('ACE-Step/acestep-5Hz-lm-0.6B', local_dir='${ckpt}/acestep-5Hz-lm-0.6B')" || echo "LM download failed (songs will be made without planning)"
-fi
-du -sh "${root}" 2>/dev/null || true
-`;
-    const scriptFile = path.join(WORK_DIR, 'acestep_local_setup.sh');
-    fs.writeFileSync(scriptFile, script);
-    log('🎵 Preparing ACE-Step on this runner (background; cached after the first run)…');
-    const r = await run('bash', [scriptFile], { timeoutMs: 22 * 60000 });
-    if (r.code !== 0) throw new Error(`local ACE-Step setup failed: ${r.stderr.split('\n').filter(Boolean).slice(-4).join(' | ').slice(0, 400)}`);
-    log(`🎵 Local ACE-Step installed in ${((Date.now() - t0) / 1000).toFixed(0)}s (${r.stdout.toString().trim().split('\n').pop() || ''}).`);
-    const useLm = aceLocalWantLm && fs.existsSync(path.join(ckpt, 'acestep-5Hz-lm-0.6B'));
-    const port = 8011, threads = String(Math.max(1, os.cpus().length));
-    const env = { ...process.env, ACESTEP_API_HOST: '127.0.0.1', ACESTEP_API_PORT: String(port), ACESTEP_API_KEY: ACE_LOCAL_KEY, ACESTEP_DEVICE: 'cpu', ACESTEP_INIT_LLM: useLm ? 'true' : 'false', ACESTEP_LM_BACKEND: 'pt', ACESTEP_LM_MODEL_PATH: 'acestep-5Hz-lm-0.6B', ACESTEP_LM_DEVICE: 'cpu',
-      ACESTEP_USE_FLASH_ATTENTION: 'false', ACESTEP_CONFIG_PATH: 'acestep-v15-turbo', ACESTEP_PROJECT_ROOT: repo, ACESTEP_CHECKPOINTS_DIR: ckpt, OMP_NUM_THREADS: threads, MKL_NUM_THREADS: threads, TOKENIZERS_PARALLELISM: 'false',
-      // ACE-Step stops a generation after 600 s by default (a GPU figure); CPUs need longer.
-      ACESTEP_GENERATION_TIMEOUT: '3600' };
-    const srv = spawn(py, ['-m', 'acestep.api_server'], { cwd: repo, env, stdio: ['ignore', 'pipe', 'pipe'] });
-    let tail = '';
-    const keep = (d: Buffer) => { tail = (tail + d.toString()).slice(-4000); };
-    srv.stdout.on('data', keep); srv.stderr.on('data', keep);
-    let exited = false; srv.on('close', () => { exited = true; });
-    const base = `http://127.0.0.1:${port}`;
-    const until = Date.now() + 12 * 60000;
-    while (Date.now() < until) {
-      if (exited) throw new Error(`local ACE-Step server stopped: ${tail.split('\n').filter(Boolean).slice(-4).join(' | ').slice(0, 400)}`);
-      try { const h = await fetch(`${base}/health`, { signal: AbortSignal.timeout(5000) }); if (h.ok) break; } catch {}
-      await sleep(3000);
-    }
-    if (Date.now() >= until) { try { srv.kill('SIGKILL'); } catch {} throw new Error('local ACE-Step server did not start within 12 min'); }
-    log(`🎵 Local ACE-Step server ready in ${((Date.now() - t0) / 1000).toFixed(0)}s${useLm ? ' (with the song-planning model)' : ''}.`);
-    return { base, lm: useLm, stop: () => { try { srv.kill('SIGKILL'); } catch {} aceLocalPrep = null; } };
-  })();
-  return aceLocalPrep;
-}
-async function aceLocalGenerate(song: MusicalSong, prep: Promise<{ base: string; stop: () => void; lm: boolean }>): Promise<{ file: string; duration: number; taskId?: string }> {
   aceStarted = Date.now();
   aceDeadline = aceStarted + CFG.acestepLocalMin * 60000;
-  const once = async (p: Promise<{ base: string; stop: () => void; lm: boolean }>) => {
-    await aceStatus('setting up ACE-Step on the runner (CPU)');
-    const beat = setInterval(() => { aceStatus('ACE-Step on the runner: installing / loading the model'); }, 30000);
-    let srv: { base: string; stop: () => void; lm: boolean };
-    try { srv = await p; } finally { clearInterval(beat); }
-    const saved = CFG.acestepBase;
-    (CFG as any).acestepBase = srv.base;
-    aceLocalRun = true;
+  let keys: string[] = [];
+  try { keys = await aceKeys(); } catch (e: any) { log(`⚠️ Could not get the music keys (${e?.message || e}).`); }
+  if (!keys.length) throw new PipelineError('acestep_auth', 'No ACE Music keys are available (set ACE_MUSIC_API_KEYS on the app server).');
+  let last: any = null;
+  for (const key of keys) {
+    if (aceLeft() < 30000) break;
     try {
-      const what = `ACE-Step on the runner is ${srv.lm ? 'planning and ' : ''}making the song (CPU)`;
-      await aceStatus(what);
-      const beat2 = setInterval(() => { aceStatus(what); }, 30000);
-      try { return await aceStepNative(song, ACE_LOCAL_KEY, !srv.lm); }   // with the planning LM: thinking on
-      finally { clearInterval(beat2); }
-    } finally {
-      (CFG as any).acestepBase = saved;
-      aceLocalRun = false;
-      srv.stop();   // free the RAM for the stems + the video render
+      await aceStatus(`ACE Music cloud is composing (key …${key.slice(-4)})`);
+      return await aceStepNative(song, key, true);
+    } catch (e: any) {
+      last = e;
+      log(`⚠️ ACE key …${key.slice(-4)} failed (${String(e?.message || e).slice(0, 160)}) — trying the next key.`);
+      if (e instanceof PipelineError && !['acestep_auth', 'acestep_quota', 'acestep_busy', 'acestep_failed'].includes(e.code)) throw e;
     }
-  };
-  try { return await once(prep); }
-  catch (e: any) {
-    if (!aceLocalWantLm || aceLeft() < 5 * 60000) throw e;
-    // The planning model failed (or the server could not load it): make the song without it.
-    log(`⚠️ ACE-Step with the planning model failed (${String(e?.message || e).slice(0, 200)}) — trying again without it.`);
-    aceLocalWantLm = false;
-    aceLocalPrep = null;
-    return once(prepareLocalAce());
   }
+  throw last || new PipelineError('acestep_busy', 'Every ACE Music key is busy right now.');
 }
 /** Set on a regeneration when the first song came out in the wrong voice. */
 let aceGenderBoost = false;
@@ -3751,64 +3997,119 @@ async function saveAceAudio(buf: Buffer, label: string) {
   if (fs.statSync(out).size < 10000) throw new PipelineError('acestep_busy', `ACE-Step (${label}) returned an empty audio clip.`);
   return { file: out, duration: await probeDuration(out) };
 }
-async function aceStepNative(song: MusicalSong, apiKey: string, fast: boolean): Promise<{ file: string; duration: number; taskId?: string }> {
-  const r = aceStepRequest(song);
-  const headers = { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json; charset=utf-8' };
-  // "thinking" (the 5Hz planning LM) gives better songs but is slower; the retry rounds switch it off.
+/** Readable reason from an ACE cloud error body (JSON detail, or an HTML error page). */
+function aceReason(status: number, text: string): string {
+  try { const j = JSON.parse(text); const d = j?.detail || j?.error?.message || j?.error || j?.message; if (d) return String(typeof d === 'string' ? d : JSON.stringify(d)).slice(0, 240); } catch { /* not JSON */ }
+  if (/<html/i.test(text)) { const t = text.match(/<title>([^<]*)<\/title>/i)?.[1] || ''; return `${status === 504 || status === 524 ? 'the music cloud timed out' : 'the music cloud is unavailable'}${t ? ` (${t.trim().slice(0, 80)})` : ''}`; }
+  return text.replace(/\s+/g, ' ').trim().slice(0, 240) || `HTTP ${status}`;
+}
+const ACE_MODEL_GUESSES = ['acemusic/acestep-v1.5-turbo', 'acemusic/acestep-v15-turbo', ''];
+let aceModelId = '';
+/** The cloud lists its model at /v1/models; the first one listed is the one ACE's own client uses. */
+async function aceCloudModel(apiKey: string): Promise<string> {
+  if (CFG.acestepModel) return CFG.acestepModel;
+  if (aceModelId) return aceModelId;
+  try {
+    const r = await fetch(`${CFG.acestepBase}/v1/models`, { headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json', 'User-Agent': 'curl/8.7.1' }, signal: AbortSignal.timeout(20000) });
+    const j: any = await r.json().catch(() => ({}));
+    const id = (Array.isArray(j?.data) ? j.data : []).map((m: any) => String(m?.id || '')).filter(Boolean)[0] || '';
+    if (id) { aceModelId = id; return id; }
+  } catch { /* use the guesses */ }
+  return ACE_MODEL_GUESSES[0];
+}
+type AceCall = { ok: true; buf: Buffer } | { ok: false; status: number; error: string };
+/** One request to the ACE Music cloud (OpenAI-style /v1/chat/completions). Streams so a long song is not cut by a gateway timeout. */
+async function aceCloudCall(apiKey: string, r: ReturnType<typeof aceStepRequest>, model: string, stream: boolean): Promise<AceCall> {
+  const lang = !r.lang || r.lang === 'pcm' || r.lang === 'unknown' ? 'en' : String(r.lang).slice(0, 8);
   const body: any = {
-    prompt: r.prompt, caption: r.prompt, lyrics: r.lyrics, audio_duration: r.target, audio_format: 'mp3', batch_size: 1, vocal_language: r.lang,
-    ...(r.bpm ? { bpm: r.bpm } : {}), ...(r.key ? { key_scale: r.key } : {}), time_signature: '4',
-    thinking: !fast, use_cot_caption: false, ai_token: apiKey, ...(CFG.acestepModel ? { model: CFG.acestepModel } : {}),
+    messages: [{ role: 'user', content: `<prompt>${String(r.prompt).slice(0, 500)}</prompt><lyrics>${r.lyrics || '[Instrumental]'}</lyrics>` }],
+    stream, thinking: false, use_format: false, sample_mode: false, use_cot_caption: false, use_cot_language: false,
+    audio_config: { duration: Math.max(20, Math.min(300, Math.round(r.target) || 60)), vocal_language: r.lyrics ? lang : 'en', format: 'mp3', ...(r.bpm ? { bpm: r.bpm } : {}), ...(r.lyrics ? {} : { instrumental: true }) },
   };
-  let taskId = '';
-  for (let attempt = 0; attempt < 3 && !taskId; attempt++) {
-    if (attempt) await sleep(8000 * attempt);
-    try {
-      const rel = await fetch(`${CFG.acestepBase}/release_task`, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(180000) });
-      const txt = await rel.text();
-      let rj: any = {}; try { rj = JSON.parse(txt); } catch {}
-      taskId = String(rj?.data?.task_id || rj?.task_id || '').trim();
-      if (!rel.ok || !taskId) {
-        const code = aceErrCode(rel.status, txt);
-        const err = new PipelineError(code, `ACE-Step request failed (HTTP ${rel.status}): ${String(rj?.error || rj?.message || txt).slice(0, 200)}`);
-        if (code !== 'acestep_busy' || attempt === 2) throw err;
-        log(`⚠️ ${err.message} — retrying…`); taskId = '';
+  if (model) body.model = model;
+  let res: Response;
+  try {
+    res = await fetch(`${CFG.acestepBase}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json; charset=utf-8', Accept: stream ? 'text/event-stream' : 'application/json', 'User-Agent': 'curl/8.7.1' },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(Math.max(60000, Math.min(12 * 60 * 1000, aceLeft()))),
+    });
+  } catch (e: any) { return { ok: false, status: 0, error: String(e?.message || e) }; }
+  if (!res.ok) { const t = await res.text().catch(() => ''); return { ok: false, status: res.status, error: aceReason(res.status, t) }; }
+  let url = '';
+  try {
+    if (/json/.test(res.headers.get('content-type') || '')) {
+      const j: any = await res.json().catch(() => ({}));
+      url = j?.choices?.[0]?.message?.audio?.[0]?.audio_url?.url || '';
+      if (!url) return { ok: false, status: 500, error: String(j?.detail || j?.error?.message || (j?.choices?.[0]?.finish_reason === 'error' ? j?.choices?.[0]?.message?.content : '') || 'the cloud answered without audio').slice(0, 300) };
+    } else {
+      // Server-sent events: heartbeats every few seconds, then a chunk carrying the audio, then [DONE].
+      const reader = res.body!.getReader(); const dec = new TextDecoder();
+      let buf = '', lastErr = '', lastBeat = 0;
+      const eat = (line: string) => {
+        line = line.trim();
+        if (!line.startsWith('data:')) return;
+        const data = line.slice(5).trim();
+        if (!data || data === '.' || data === '[DONE]') return;
+        try {
+          const j = JSON.parse(data);
+          const d = j?.choices?.[0]?.delta || j?.choices?.[0]?.message || {};
+          const u = d?.audio?.[0]?.audio_url?.url;
+          if (u) url = u;
+          if (j?.choices?.[0]?.finish_reason === 'error' || j?.error) lastErr = String(j?.error?.message || j?.error || d?.content || 'generation error');
+        } catch { /* partial line */ }
+      };
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        if (Date.now() - lastBeat > 15000) { lastBeat = Date.now(); void aceStatus('ACE Music cloud is composing'); }
+        let nl: number;
+        while ((nl = buf.indexOf('\n')) >= 0) { eat(buf.slice(0, nl)); buf = buf.slice(nl + 1); }
       }
-    } catch (e: any) {
-      if (e instanceof PipelineError) throw e;
-      if (attempt === 2) throw new PipelineError('acestep_busy', `ACE-Step did not accept the song request (${e?.message || e}).`);
-      log(`⚠️ ACE-Step request attempt ${attempt + 1} failed (${e?.message || e}); retrying…`);
+      if (buf) eat(buf);
+      if (!url) return { ok: false, status: 500, error: lastErr || 'the stream ended without audio' };
     }
+  } catch (e: any) { return { ok: false, status: 0, error: `the song stream was interrupted (${e?.message || e})` }; }
+  const m = url.match(/^data:[^,]*;base64,(.+)$/s);
+  if (m) return { ok: true, buf: Buffer.from(m[1].replace(/\s+/g, ''), 'base64') };
+  if (!/^https?:/i.test(url)) return { ok: false, status: 500, error: 'unknown audio format' };
+  for (let d = 0; d < 3; d++) {
+    try {
+      const dl = await fetch(url, { headers: { 'User-Agent': 'curl/8.7.1' }, signal: AbortSignal.timeout(240000) });
+      if (!dl.ok) throw new Error(`HTTP ${dl.status}`);
+      return { ok: true, buf: Buffer.from(await dl.arrayBuffer()) };
+    } catch (e: any) { if (d === 2) return { ok: false, status: 500, error: `audio download failed: ${e?.message || e}` }; await sleep(4000); }
   }
-  log(`🎵 ACE-Step task ${taskId.slice(0, 24)} accepted${fast ? ' (fast mode)' : ''}; waiting for the song…`);
-  const started = Date.now();
-  for (let attempt = 0; Date.now() - started < Math.min(aceLocalRun ? 60 * 60 * 1000 : 15 * 60 * 1000, aceLeft()); attempt++) {
-    await sleep(attempt < 6 ? 5000 : 8000);
-    let q: Response;
-    try { q = await fetch(`${CFG.acestepBase}/query_result`, { method: 'POST', headers, body: JSON.stringify({ task_id_list: [taskId] }), signal: AbortSignal.timeout(45000) }); }
-    catch { continue; }
-    const qj: any = await q.json().catch(() => ({}));
-    if (!q.ok) { if (q.status === 429 || q.status >= 500) continue; throw new PipelineError(aceErrCode(q.status, JSON.stringify(qj)), `ACE-Step status check failed (HTTP ${q.status}).`); }
-    const item = Array.isArray(qj?.data) ? qj.data[0] : Array.isArray(qj) ? qj[0] : qj?.data;
-    const status = Number(item?.status ?? 0);
-    if (status === 2) throw new PipelineError('acestep_busy', `ACE-Step could not generate the song: ${String(item?.error || item?.result || 'failed').slice(0, 200)}`);
-    if (status !== 1) { if (attempt % 8 === 0) log(`🎵 ACE-Step still generating (${Math.round((Date.now() - started) / 1000)}s)…`); continue; }
-    let res: any = item?.result;
-    if (typeof res === 'string') { try { res = JSON.parse(res); } catch { res = []; } }
-    const first = Array.isArray(res) ? res[0] : res;
-    const fileRef = String(first?.file || first?.audio_url || first?.url || '');
-    if (!fileRef) throw new PipelineError('acestep_busy', 'ACE-Step finished but returned no audio file.');
-    if (/^data:audio/i.test(fileRef)) return { ...(await saveAceAudio(Buffer.from(fileRef.split(',')[1] || '', 'base64'), 'async')), taskId };
-    const url = /^https?:\/\//i.test(fileRef) ? fileRef : `${CFG.acestepBase}${fileRef.startsWith('/') ? '' : '/'}${fileRef}`;
-    for (let d = 0; d < 3; d++) {
-      try {
-        const dl = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` }, signal: AbortSignal.timeout(240000) });
-        if (!dl.ok) throw new Error(`HTTP ${dl.status}`);
-        return { ...(await saveAceAudio(Buffer.from(await dl.arrayBuffer()), 'async')), taskId };
-      } catch (e: any) { if (d === 2) throw new PipelineError('acestep_busy', `ACE-Step audio download failed: ${e?.message || e}`); await sleep(5000); }
+  return { ok: false, status: 500, error: 'audio download failed' };
+}
+async function aceStepNative(song: MusicalSong, apiKey: string, _fast: boolean): Promise<{ file: string; duration: number; taskId?: string }> {
+  const r = aceStepRequest(song);
+  let model = await aceCloudModel(apiKey);
+  let res: AceCall = { ok: false, status: 0, error: 'not started' };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) { log(`⚠️ ACE Music cloud: ${(res as any).error} — retrying…`); await sleep(8000 * attempt); }
+    if (aceLeft() < 30000) break;
+    res = await aceCloudCall(apiKey, r, model, true);
+    // Wrong model name: try the other known names (and none), and remember the one that works.
+    if (!res.ok && [400, 404, 422].includes(res.status) && /model/i.test(res.error)) {
+      for (const alt of ACE_MODEL_GUESSES.filter((x) => x !== model)) {
+        res = await aceCloudCall(apiKey, r, alt, true);
+        if (res.ok || !/model/i.test(res.error)) { model = alt; aceModelId = alt; break; }
+      }
     }
+    // Streaming answered without audio or was cut: ask once the plain (non-streaming) way.
+    if (!res.ok && res.status !== 401 && res.status !== 403 && res.status !== 429 && res.status < 500 && res.status !== 404) {
+      const plain = await aceCloudCall(apiKey, r, model, false);
+      res = plain.ok ? plain : { ...plain, error: `${plain.error} (streaming: ${res.error})` };
+    }
+    if (res.ok) break;
+    // Only a busy / unreachable service is worth asking again with the same key.
+    if (aceErrCode(res.status, res.error) !== 'acestep_busy' && res.status !== 0) break;
   }
-  throw new PipelineError('acestep_busy', `ACE-Step task ${taskId} did not finish in time (${Math.round((Date.now() - started) / 60000)} min).`);
+  if (!res.ok) throw new PipelineError(res.status === 0 ? 'acestep_busy' : aceErrCode(res.status, res.error), `ACE Music cloud request failed (HTTP ${res.status || 'no answer'}): ${res.error}`);
+  const saved = await saveAceAudio(res.buf, 'cloud');
+  return { ...saved };
 }
 /** Google Lyria via the Gemini API (Interactions). PAID — only used when LYRIA_ENABLED=true and a billing-enabled Gemini key is set. */
 async function generateLyriaMusic(song: MusicalSong): Promise<{ file: string; duration: number; taskId?: string }> {
@@ -3839,7 +4140,7 @@ async function generateLyriaMusic(song: MusicalSong): Promise<{ file: string; du
   throw new PipelineError('lyria_failed', `Lyria music generation failed: ${lastErr || 'unknown error'}`);
 }
 
-const MUSIC_ENGINE_LABEL: Record<string, string> = { acestep: 'ACE-Step 1.5 (on the runner)', lyria: 'Google Lyria' };
+const MUSIC_ENGINE_LABEL: Record<string, string> = { acestep: 'ACE Music cloud (ACE-Step 1.5)', lyria: 'Google Lyria' };
 /** ACE-Step is the music engine. (Google Lyria is only tried if LYRIA_ENABLED=true with a paid Gemini key.) */
 async function generateMusicTrack(song: MusicalSong): Promise<{ file: string; duration: number; engine: string }> {
   const available = ['acestep', 'lyria'].filter((p) => (p === 'acestep' ? true : CFG.lyriaEnabled && CFG.geminiKeys.length > 0));
@@ -3860,49 +4161,22 @@ async function generateMusicTrack(song: MusicalSong): Promise<{ file: string; du
   throw new PipelineError('music_all_failed', `Music generation failed — ${errors.join(' | ')}. Nothing was posted; the next run will retry.`);
 }
 
-/**
- * Word-level lyric timing with Whisper on THIS runner (faster-whisper, CPU int8) — no API keys,
- * no outside transcription service.
- */
-async function transcribeLocal(file: string): Promise<Word[]> {
-  const python = ENV.PYTHON || 'python3';
-  const chk = await run(python, ['-c', 'import faster_whisper'], { timeoutMs: 60000 });
-  if (chk.code !== 0) {
-    const ins = await run(python, ['-m', 'pip', 'install', '--quiet', '--disable-pip-version-check', 'faster-whisper'], { timeoutMs: 10 * 60000 });
-    if (ins.code !== 0) { log(`⚠️ faster-whisper could not be installed (${ins.stderr.slice(-200)}).`); return []; }
+/** Speech → timed words with hosted Groq Whisper (through the app server, keys rotated). Nothing runs on this CPU. */
+async function hostedWords(file: string, language: string, hint: string): Promise<{ text: string; start: number; end: number }[]> {
+  if (!RELAY.available) { log('⚠️ Speech recognition needs the app address and runner key.'); return []; }
+  const wav = path.join(WORK_DIR, `asr_${crypto.randomBytes(4).toString('hex')}.wav`);
+  if ((await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', file, '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', wav], { timeoutMs: 120000 })).code !== 0) return [];
+  const bytes = new Uint8Array(fs.readFileSync(wav));
+  const lang = language && !['unknown', 'pcm'].includes(language) ? language.slice(0, 2) : '';
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const r = await RELAY.stt(bytes, 'audio/wav', { language: lang, prompt: hint.slice(0, 220) });
+      return r.words.map((w) => ({ text: w.word, start: w.start, end: w.end })).filter((w) => w.text && Number.isFinite(w.start) && Number.isFinite(w.end));
+    } catch (e: any) { log(`⚠️ Speech recognition attempt ${attempt + 1} failed (${String(e?.message || e).slice(0, 160)}).`); await sleep(3000 * (attempt + 1)); }
   }
-  const py = path.join(WORK_DIR, 'lyrics_asr.py');
-  fs.writeFileSync(py, `import json,sys,os
-import av as _av
-_av_open=_av.open
-def _open(*a,**k):
-  k.pop("metadata_errors",None)
-  return _av_open(*a,**k)
-_av.open=_open
-def _pcm(p):
-  import subprocess,numpy as np
-  try:
-    r=subprocess.run(["ffmpeg","-nostdin","-v","error","-i",p,"-f","s16le","-ac","1","-ar","16000","-"],capture_output=True,check=True)
-    a=np.frombuffer(r.stdout,np.int16).astype(np.float32)/32768.0
-    return a if a.size>1600 else p
-  except Exception:
-    return p
-from faster_whisper import WhisperModel
-m=WhisperModel("small",device="cpu",compute_type="int8",cpu_threads=os.cpu_count() or 2)
-lang=sys.argv[2] if len(sys.argv)>2 and sys.argv[2] not in ("","unknown","pcm") else None
-segs,_=m.transcribe(_pcm(sys.argv[1]),word_timestamps=True,vad_filter=False,language=lang)
-out=[]
-for s in segs:
-  for w in (s.words or []): out.append({"text":w.word.strip(),"start":w.start,"end":w.end})
-print(json.dumps(out))
-`);
-  const r = await run(python, [py, file, musicLanguage().code], { timeoutMs: 20 * 60000 });
-  if (r.code !== 0) { log(`⚠️ Local lyric transcription failed (${r.stderr.slice(-200)}).`); return []; }
-  try {
-    const list = JSON.parse(r.stdout.toString().trim().split('\n').pop() || '[]');
-    return (Array.isArray(list) ? list : []).filter((w: any) => w.text && Number.isFinite(w.start) && Number.isFinite(w.end));
-  } catch { return []; }
+  return [];
 }
+async function transcribeLocal(file: string): Promise<Word[]> { return (await hostedWords(file, musicLanguage().code, '')) as unknown as Word[]; }
 
 // ---------------------------------------------------------------------------
 // Stem separation (Demucs, open-source, runs on the GitHub runner's CPU).
@@ -4085,6 +4359,7 @@ function timingForMusic(song: MusicalSong, transcript: Word[], duration: number,
   let lastLine = 0;
   const words = words0.map((w) => { const ln = typeof w.token === 'number' && w.token >= 0 ? lay.tokenLine[w.token] ?? lastLine : lastLine; lastLine = ln; return { ...w, line: ln } as Word; });
   const sections: { start: number; end: number; tag: string; emotion: string }[] = [];
+  const chorusTotal = song.sections.filter((x) => x.tag === 'chorus').length;
   const totalWords = Math.max(1, song.lyrics.split(/\s+/).filter(Boolean).length);
   let cursor = 0;
 
@@ -4101,7 +4376,8 @@ function timingForMusic(song: MusicalSong, transcript: Word[], duration: number,
     const minEnd = Math.min(duration, start + 0.8);
     const end = clampNum(Math.max(minEnd, roughEnd), minEnd, duration);
     if (end <= start) break;
-    sections.push({ start, end, tag: sec.tag, emotion: sec.emotion || musicalProfile().emotion });
+    const chorusNo = song.sections.slice(0, song.sections.indexOf(sec) + 1).filter((x) => x.tag === 'chorus').length;
+    sections.push({ start, end, tag: sec.tag, emotion: moodSectionEmotion(sec.tag, chorusNo, chorusTotal) || sec.emotion || musicalProfile().emotion });
     // Cursor is monotonic: a matched transcript word can only advance section timing.
     cursor = Math.max(cursor, end);
     if (cursor >= duration) break;
@@ -4110,13 +4386,90 @@ function timingForMusic(song: MusicalSong, transcript: Word[], duration: number,
   if (sections.length) sections[sections.length - 1].end = duration;
   return { words, sections };
 }
+/**
+ * Music video performed to the person's OWN song (Creative Studio → "Use my own music").
+ * The uploaded file is fetched from the app, trimmed to the video length limit (with a short fade-out when it is cut)
+ * and converted to a plain stereo WAV, then goes through exactly the same stem separation, lyric timing, singer
+ * lip-sync and band performance as an AI-composed song.
+ */
+async function loadUploadedSong(): Promise<{ file: string; duration: number; engine: string }> {
+  const S = STUDIO!;
+  if (!S.musicUrl) throw new PipelineError('music_missing', 'Your own song was selected, but no audio file arrived. Please upload it again.');
+  await reportStatus('running', '2/6 Preparing your song', 24, 'Loading your own music…');
+  const response = await fetch(`${CFG.appUrl.replace(/\/+$/, '')}${S.musicUrl}`, { headers: { 'X-Animato-Runner-Key': CFG.runnerKey } });
+  if (!response.ok) throw new PipelineError('music_fetch_failed', `Could not fetch your uploaded song (HTTP ${response.status}).`);
+  const raw = path.join(WORK_DIR, `own_song_${S.id}.audio`);
+  fs.writeFileSync(raw, Buffer.from(await response.arrayBuffer()));
+  const full = await probeDuration(raw);
+  if (!(full > 0)) throw new PipelineError('music_unreadable', 'Your uploaded file could not be read as audio. Try an MP3, M4A or WAV file.');
+  const limit = Math.max(15, Math.min(60, S.maxSeconds || 60));
+  const keep = Math.min(full, limit);
+  const out = path.join(WORK_DIR, `own_song_${S.id}.wav`);
+  const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', raw, '-vn', '-t', keep.toFixed(2), '-ac', '2', '-ar', '44100'];
+  if (full > limit + 0.5) args.push('-af', `afade=t=out:st=${Math.max(0, keep - 1.5).toFixed(2)}:d=1.5`);
+  args.push('-c:a', 'pcm_s16le', out);
+  const r = await run('ffmpeg', args, { timeoutMs: 180000 });
+  if (r.code !== 0 || !fs.existsSync(out)) throw new PipelineError('music_unreadable', 'Your uploaded file could not be converted. Try an MP3, M4A or WAV file.');
+  const duration = await probeDuration(out);
+  if (duration < 5) throw new PipelineError('music_too_short', `Your song is only ${duration.toFixed(1)}s long — use a track of at least 5 seconds.`);
+  log(`🎵 Using the uploaded song: ${duration.toFixed(1)}s${full > limit + 0.5 ? ` (trimmed from ${full.toFixed(0)}s)` : ''}.`);
+  return { file: out, duration, engine: 'upload' };
+}
+/**
+ * Own song with NO lyrics typed in: build the lyric lines and sections from what was actually sung in the track
+ * (Whisper transcript of the isolated vocals), so the captions and singer timing still work.
+ * If nothing intelligible was heard (instrumental, or a language the transcriber could not read) the captions
+ * show a music note instead of made-up words.
+ */
+function songFromTranscript(words: Word[], title: string): MusicalSong {
+  const style = String(CFG.subGenre || 'original music');
+  const gender = CFG.gender === 'male' ? 'male' : 'female';
+  const lines: string[] = [];
+  let cur: string[] = [], prevEnd = -1;
+  const flush = () => { if (cur.length) lines.push(cur.join(' ')); cur = []; };
+  for (const w of words) {
+    const t = String(w.text || '').trim();
+    if (!t) continue;
+    if (cur.length && ((prevEnd >= 0 && w.start - prevEnd > 0.8) || cur.length >= 7)) flush();
+    cur.push(t); prevEnd = w.end;
+    if (/[.!?]$/.test(t) && cur.length >= 3) flush();
+  }
+  flush();
+  const calm = musicalProfile().emotion;
+  let sections: MusicalSection[];
+  if (words.length > 5 && lines.length >= 2) {
+    const key = (l: string) => l.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+    const counts = new Map<string, number>();
+    for (const l of lines) counts.set(key(l), (counts.get(key(l)) || 0) + 1);
+    sections = [];
+    for (let i = 0; i < lines.length; i += 4) {
+      const group = lines.slice(i, i + 4);
+      const repeated = group.some((l) => (counts.get(key(l)) || 0) >= 2);
+      sections.push({ tag: repeated ? 'chorus' : 'verse', lyrics: group.join('\n'), emotion: repeated ? 'excited' : calm });
+    }
+  } else {
+    log('🎵 No sung words could be made out in your song — the video will show a music note instead of lyrics.');
+    sections = [{ tag: 'verse', lyrics: '♪', emotion: calm }, { tag: 'chorus', lyrics: '♪', emotion: 'excited' }, { tag: 'verse', lyrics: '♪', emotion: calm }];
+  }
+  const firstLine = lines[0] || '';
+  const name = String(title || '').trim() || firstLine.replace(/[.!?,].*$/, '').slice(0, 70).trim() || 'My Music Video';
+  return { title: name.slice(0, 90), description: `Music video performed to the artist's own ${style} track by a ${gender} lead singer.`, lyrics: sectionLyricText(sections), sections, hashtags: musicHashtags(style), tags: ['original music', style, 'music video'] };
+}
 async function produceMusical(t0: number, pastTitles: string[]): Promise<number> {
   // Start installing / loading ACE-Step on this runner right away, while the lyrics are written.
-  prepareLocalAce().catch(() => {});
-  await reportStatus('running', '1/6 Writing the original song', 10, `Writing a ${CFG.subGenre || 'musical'} song for a ${CFG.gender} lead singer…`);
-  const song = await writeMusicalSong(pastTitles);
-  let generated = await generateMusicTrack(song);
-  const engineName = generated.engine === 'lyria' ? 'google-lyria' : 'ace-step-1.5';
+  const ownSong = STUDIO?.kind === 'musical' && STUDIO.musicMode === 'upload';
+  // Own song and no lyrics typed in: do not write a new song — the words are taken from the track itself below.
+  const lyricsFromTrack = ownSong && !cleanMusicLyrics(String(CFG.musicalLyrics || '')).trim();
+  let song: MusicalSong;
+  if (lyricsFromTrack) {
+    await reportStatus('running', '1/6 Getting ready', 10, 'Using your own song — the lyrics will be picked up from the track.');
+    song = songFromTranscript([], String(STUDIO?.title || ''));
+  } else {
+    await reportStatus('running', '1/6 Writing the original song', 10, `Writing a ${CFG.subGenre || 'musical'} song for a ${CFG.gender} lead singer…`);
+    song = await writeMusicalSong(pastTitles);
+  }
+  let generated = ownSong ? await loadUploadedSong() : await generateMusicTrack(song);
+  const engineName = generated.engine === 'upload' ? 'user-upload' : generated.engine === 'lyria' ? 'google-lyria' : 'ace-step-1.5';
   let stems = await separateStems(generated.file, generated.duration);
   let vocalSpans = stems ? await vocalSpansOf(stems.vocals).catch(() => []) : [];
   // Voice check: the song must be sung by the singer the user chose (female / male).
@@ -4142,9 +4495,10 @@ async function produceMusical(t0: number, pastTitles: string[]): Promise<number>
   if (stems) log(`🎚 ${vocalSpans.length} sung phrases; drums level ${drumLevel.toFixed(2)}, keys/other level ${keysLevel.toFixed(2)}.`);
   // Transcribe the isolated vocals when we have them (far cleaner than the full mix).
   const transcript = await transcribeSong(stems?.vocals || generated.file);
+  if (lyricsFromTrack) song = songFromTranscript(transcript, String(STUDIO?.title || ''));
   const timing = timingForMusic(song, transcript, generated.duration, vocalSpans);
   if (!transcript.length && vocalSpans.length) log(`Lyric timing: no transcript — ${timing.words.length} words laid over ${vocalSpans.length} sung phrases.`);
-  const cues = timing.sections.flatMap((sg) => [{ t: sg.start, tag: sg.emotion }, ...(sg.tag === 'chorus' ? [{ t: sg.start + 0.15, tag: 'excited' }] : [])]).filter((x) => EMOTION_TAGS.includes(x.tag));
+  const cues = timing.sections.flatMap((sg) => [{ t: sg.start, tag: sg.emotion }, ...(sg.tag === 'chorus' ? [{ t: sg.start + 0.15, tag: songMood() ? sg.emotion : 'excited' }] : [])]).filter((x) => EMOTION_TAGS.includes(x.tag));
   const chorusIntervals = timing.sections.filter((s) => s.tag === 'chorus').map((s) => ({ start: s.start, end: s.end }));
   await reportStatus('running', '3/6 Building the music-video performance', 45, `Timed ${timing.words.length} words; ${chorusIntervals.length} chorus sections will bring in the choir.`);
   const lyricLines = lyricLayout(song).lines;
@@ -4154,14 +4508,23 @@ async function produceMusical(t0: number, pastTitles: string[]): Promise<number>
   const title = song.title;
   const badge = (CFG.subGenre || 'MUSICAL').toUpperCase().slice(0, 24);
   const endCard = 'Follow for the next original song';
-  const stage = await renderWithStage({ narration, scenes: timing.sections.map((s) => ({ narration: s.tag === 'chorus' ? 'CHORUS' : s.tag, shot: 'scene', emotion: s.emotion, imageQuery: '', imageCredit: '' })) as unknown as Scene[], times: timing.sections.map((s) => ({ start: s.start, end: s.end })), cues, images: timing.sections.map(() => null), title, badge, endCard, music: null, duration: generated.duration, musicalStage: true, chorusIntervals, lyrics: { lines: lyricLines.map((text, i) => ({ text, en: lyricEn[i] || '' })), noSpaces: NO_SPACE_LANGS.has(musicLanguage().code) }, musical: { stageId: CFG.stageId || 0, stageAutoSeed: `${CFG.campaignId || CFG.campaignName || 'local'}:${CFG.partNumber}`, style: CFG.subGenre || '', sections: timing.sections, vocalSpans, drumLevel, keysLevel }, stems: stems || undefined });
+  const stage = await renderWithStage({ narration, scenes: timing.sections.map((s) => ({ narration: s.tag === 'chorus' ? 'CHORUS' : s.tag, shot: 'scene', emotion: s.emotion, imageQuery: '', imageCredit: '' })) as unknown as Scene[], times: timing.sections.map((s) => ({ start: s.start, end: s.end })), cues, images: timing.sections.map(() => null), title, badge, endCard, music: null, duration: generated.duration, musicalStage: true, chorusIntervals, lyrics: { lines: lyricLines.map((text, i) => ({ text, en: lyricEn[i] || '' })), noSpaces: NO_SPACE_LANGS.has(musicLanguage().code) }, musical: { mood: songMood(), stageId: CFG.stageId || 0, stageAutoSeed: `${STUDIO?.id || CFG.campaignId || CFG.campaignName || 'local'}:${CFG.partNumber}:${Date.now()}`, style: CFG.subGenre || '', sections: timing.sections, vocalSpans, drumLevel, keysLevel }, stems: stems || undefined });
   if (!stage.ok) throw new PipelineError('musical_render_failed', `Musical stage render failed: ${stage.reason || 'unknown error'}`);
   const outDur = await probeDuration(OUTPUT_VIDEO);
   if (outDur < 5) throw new PipelineError('musical_render_failed', `Rendered musical video is only ${outDur.toFixed(1)}s long.`);
   const tags = Array.from(new Set([...(song.tags || []), ...(song.hashtags || []), engineName, 'music video']));
   const hashtagLine = youtubeHashtagLine([...(song.hashtags || musicHashtags(CFG.subGenre)), ...(IS_SHORTS ? ['shorts'] : [])]);
   const description = sanitizeYouTubeDescription([song.description, `🎤 Lead singer: ${CFG.gender}.`, `🎵 Style: ${CFG.subGenre || 'Musical'}.`, '🎬 Original cinematic music video with live-style stage performance, microphone, choir chorus, lip-sync and timed captions.', hashtagLine].join('\n\n'));
-  fs.writeFileSync(OUTPUT_META, JSON.stringify({ campaignId: CFG.campaignId, partNumber: CFG.partNumber, format: CFG.format, aspect: CFG.aspect, title, description, hashtags: song.hashtags, tags, model: engineName, lyrics: song.lyrics, sections: timing.sections, cues, voice: engineName, character: stage.character, durationSec: outDur, createdAt: new Date().toISOString() }, null, 2));
+  fs.writeFileSync(OUTPUT_META, JSON.stringify({ campaignId: CFG.campaignId, partNumber: CFG.partNumber, format: CFG.format, aspect: CFG.aspect, title, description, hashtags: song.hashtags, tags, model: engineName, lyrics: song.lyrics, sections: timing.sections, cues, voice: engineName, character: stage.character, durationSec: outDur, musicVariantId: STUDIO?.id || `${CFG.campaignId}:${CFG.partNumber}:${Date.now()}`, createdAt: new Date().toISOString() }, null, 2));
+  // A Tools music video is a one-off MP4. Return it directly to the user's creative list;
+  // do not save it as an automation episode or publish it to a connected social account.
+  if (STUDIO?.kind === 'musical') {
+    if (STUDIO.watermark) await studioWatermark();
+    await reportStatus('running', 'Saving your music video MP4', 92, `Rendered ${Math.round(outDur)}s.`);
+    await studioDeliver(STUDIO, { title: song.title || STUDIO.title || 'My Music Video', durationSec: Math.round(await probeDuration(OUTPUT_VIDEO)) });
+    await reportStatus('completed', 'Your music video is ready', 100, `Done in ${Math.round((Date.now() - t0) / 1000)}s.`);
+    return 0;
+  }
   const libId = await saveToLibrary({ title, topic: CFG.topic || CFG.subGenre, kind: 'musical', durationSec: Math.round(outDur), width: W, height: H });
   const picked = await pickBestFrame(OUTPUT_VIDEO, outDur, chorusIntervals.map((c) => ({ t: c.start + 1, w: 0.9 })));
   await saveLibraryThumbnail(libId, picked?.file || null);
@@ -4198,51 +4561,10 @@ async function produceMusical(t0: number, pastTitles: string[]): Promise<number>
 // ---------------------------------------------------------------------------
 // Studio → Create animation: the user's own script / voice → one finished MP4 for the app.
 // ---------------------------------------------------------------------------
-/** Speech → words with timings (faster-whisper on this runner, installed on first use). */
+/** Speech → words with timings (hosted Groq Whisper through the app server). */
 async function transcribeVoice(audio: string, hint: string): Promise<Word[] | null> {
-  const venv = path.join(os.homedir(), 'asr-venv');
-  let py = path.join(venv, 'bin', 'python');
-  if (!fs.existsSync(py) || (await run(py, ['-c', 'import faster_whisper'], { timeoutMs: 60000 })).code !== 0) {
-    log('Setting up speech recognition (first time only)…');
-    if ((await run('python3', ['-m', 'venv', venv], { timeoutMs: 180000 })).code !== 0) py = 'python3';
-    let r = await run(py, ['-m', 'pip', 'install', '-q', '--disable-pip-version-check', 'faster-whisper'], { timeoutMs: 900000 });
-    if (r.code !== 0) r = await run(py, ['-m', 'pip', 'install', '-q', '--disable-pip-version-check', '--break-system-packages', 'faster-whisper'], { timeoutMs: 900000 });
-    if ((await run(py, ['-c', 'import faster_whisper'], { timeoutMs: 60000 })).code !== 0) { log(`Speech recognition unavailable: ${r.stderr.slice(-200)}`); return null; }
-  }
-  const script = path.join(WORK_DIR, 'studio_asr.py');
-  fs.writeFileSync(script, `import json,sys
-import av as _av
-_av_open=_av.open
-def _open(*a,**k):
-  k.pop("metadata_errors",None)
-  return _av_open(*a,**k)
-_av.open=_open
-def _pcm(p):
-  import subprocess,numpy as np
-  try:
-    r=subprocess.run(["ffmpeg","-nostdin","-v","error","-i",p,"-f","s16le","-ac","1","-ar","16000","-"],capture_output=True,check=True)
-    a=np.frombuffer(r.stdout,np.int16).astype(np.float32)/32768.0
-    return a if a.size>1600 else p
-  except Exception:
-    return p
-from faster_whisper import WhisperModel
-audio,hint,out=sys.argv[1],sys.argv[2],sys.argv[3]
-m=WhisperModel("base",device="cpu",compute_type="int8",cpu_threads=4)
-segs,info=m.transcribe(_pcm(audio),word_timestamps=True,beam_size=1,condition_on_previous_text=False,initial_prompt=(hint or None))
-words=[]
-for s in segs:
-  for w in (s.words or []):
-    t=w.word.strip()
-    if t: words.append({"text":t,"start":round(w.start,3),"end":round(w.end,3)})
-json.dump(words,open(out,"w"))
-`);
-  const wav = path.join(WORK_DIR, 'studio_asr.wav');
-  if ((await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', audio, '-ac', '1', '-ar', '16000', wav], { timeoutMs: 120000 })).code !== 0) return null;
-  const out = path.join(WORK_DIR, 'studio_asr.json');
-  const r = await run(py, [script, wav, hint.slice(0, 220), out], { timeoutMs: 30 * 60_000 });
-  if (r.code !== 0 || !fs.existsSync(out)) { log(`Transcription failed: ${r.stderr.slice(-200)}`); return null; }
-  const list: { text: string; start: number; end: number }[] = JSON.parse(fs.readFileSync(out, 'utf8') || '[]');
-  return list.length ? list.map((w, i) => ({ text: w.text.replace(/\s+/g, ''), start: w.start, end: w.end, token: i })) : null;
+  const list = await hostedWords(audio, '', hint);
+  return list.length ? list.map((w, i) => ({ text: w.text.replace(/\s+/g, ''), start: w.start, end: w.end, token: i })) as unknown as Word[] : null;
 }
 
 /** The user's recording: trimmed to the plan's length, levelled, and turned into timed words. */
@@ -4281,8 +4603,19 @@ async function studioScenes(S: StudioJob, text: string): Promise<Script> {
   let k = 0;
   for (const g of groups) { const n = g.split(/\s+/).filter(Boolean).length; parts.push(words.slice(k, k + n).join(' ')); k += n; }
   if (k < words.length) parts[parts.length - 1] = `${parts[parts.length - 1]} ${words.slice(k).join(' ')}`.trim();
-  const style = S.kind === 'story' ? 'storybook illustration, 3D animated film still, warm cinematic light, rich colours' : S.kind === 'kids' ? 'bright cheerful cartoon illustration for children, soft shapes, pastel colours' : 'clean modern illustration, soft light, vibrant colours';
-  let prompts: { imagePrompt: string; searchQuery: string; emotion: string; title?: string }[] = parts.map((p) => ({ imagePrompt: `${style}, ${p.slice(0, 220)}`, searchQuery: p.split(/\s+/).filter((w) => w.length > 4).slice(0, 4).join(' '), emotion: 'neutral' }));
+  const style = S.kind === 'story'
+    ? 'storybook illustration, 3D animated film still, warm cinematic light, rich colours'
+    : S.kind === 'kids'
+      ? 'bright cheerful cartoon illustration for children, soft shapes, pastel colours'
+      : S.kind === 'ads'
+        ? 'premium product advertising, polished commercial cinematography, clear product focus, brand-consistent colours, uncluttered composition, realistic lighting, legible-safe negative space, no invented logos or text'
+        : 'clean modern illustration, soft light, vibrant colours';
+  // Use facts extracted from a supplied PDF and a public business website as storyboard context.
+  // The user's supplied script remains the only spoken narration; unverified claims are not added.
+  const adContext = S.kind === 'ads'
+    ? String(S.adBrief || '').replace(/\s+/g, ' ').slice(0, 7000)
+    : '';
+  let prompts: { imagePrompt: string; searchQuery: string; videoQuery?: string; emotion: string; title?: string }[] = parts.map((p) => ({ imagePrompt: `${style}, ${p.slice(0, 220)}`, searchQuery: p.split(/\s+/).filter((w) => w.length > 4).slice(0, 4).join(' '), emotion: 'neutral' }));
   // The script's own [tags], re-based onto each scene's words.
   const offsets: number[] = [];
   { let o = 0; for (const p of parts) { offsets.push(o); o += p.split(/\s+/).filter(Boolean).length; } }
@@ -4293,10 +4626,10 @@ async function studioScenes(S: StudioJob, text: string): Promise<Script> {
   };
   let title = S.title;
   if (!CFG.offline) {
-    const user = `Here is a narration split into ${parts.length} scenes. For EACH scene write a vivid image prompt (what the picture shows; ${style}), a 2-4 word ${S.kind === 'story' || S.kind === 'kids' ? 'search query for a matching cartoon illustration (the main subject, e.g. "fox river night")' : 'stock-photo search query'}, and the speaker's emotion (one of: ${EMOTION_TAGS.join(', ')}). Also give the video a catchy title (max 60 chars).
-SCENES:
-${parts.map((p, i) => `${i + 1}. ${p}`).join('\n')}
-Return ONLY JSON: {"title": "", "scenes": [{"imagePrompt": "", "searchQuery": "", "emotion": "neutral"}]}`;
+    const adInstruction = S.kind === 'ads'
+      ? `AD CAMPAIGN CONTEXT (guide visuals only; do not invent claims or add facts to spoken narration):\n${adContext || 'No product PDF facts supplied; use the user script and any live official website screenshot only.'}\n`
+      : '';
+    const user = `Here is a narration split into ${parts.length} scenes. For EACH scene write a vivid image prompt (what the picture shows; ${style}), a 2-4 word ${S.kind === 'story' || S.kind === 'kids' ? 'search query for a matching cartoon illustration (the main subject, e.g. "fox river night")' : 'stock-photo search query'}, and the speaker's emotion (one of: ${EMOTION_TAGS.join(', ')})${S.kind === 'story' || S.kind === 'kids' ? ', plus "videoQuery": 2-4 plain words for REAL STOCK FOOTAGE of exactly what the narration says in that scene and in the SAME FEELING (a heartbreaking scene gets quiet sombre footage such as "woman crying window" or "rain on glass", never dancing or parties; a joyful scene gets warm joyful footage; no character names)' : ''}. Also give the video a catchy title (max 60 chars).\n${adInstruction}SCENES:\n${parts.map((p, i) => `${i + 1}. ${p}`).join('\n')}\nReturn ONLY JSON: {"title": "", "scenes": [{"imagePrompt": "", "searchQuery": "", "emotion": "neutral"}]}`;
     for await (const a of LLM.attempts({ system: 'You are a storyboard artist for animated videos. You answer with one JSON object.', user, json: true, temperature: 0.7, maxTokens: 3000, timeoutMs: 90000, task: 'studio_storyboard' })) {
       try {
         const j = extractJsonObject(a.text);
@@ -4304,6 +4637,7 @@ Return ONLY JSON: {"title": "", "scenes": [{"imagePrompt": "", "searchQuery": ""
         prompts = parts.map((_, i) => ({
           imagePrompt: `${style}, ${String(j.scenes[i].imagePrompt || prompts[i].imagePrompt).slice(0, 400)}`,
           searchQuery: String(j.scenes[i].searchQuery || prompts[i].searchQuery).slice(0, 60),
+          videoQuery: String(j.scenes[i].videoQuery || '').replace(/[^\w\s'-]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60),
           emotion: EMOTION_TAGS.includes(String(j.scenes[i].emotion)) ? String(j.scenes[i].emotion) : 'neutral',
         }));
         if (!title && j.title) title = String(j.title).slice(0, 80);
@@ -4314,37 +4648,62 @@ Return ONLY JSON: {"title": "", "scenes": [{"imagePrompt": "", "searchQuery": ""
   return {
     title: title || parts[0].split(/\s+/).slice(0, 7).join(' ').replace(/[.,!?]+$/, ''),
     description: '', hashtags: [], tags: [], visualStyle: style, characters: '', usedFallbackTemplate: false,
-    scenes: parts.map((p, i) => ({ narration: p, cues: [{ index: 0, tag: prompts[i].emotion }, ...sceneCues(i)], shot: i === 0 ? 'scene' : (i % 3 === 2 ? 'panel' : 'scene'), emotion: prompts[i].emotion, imagePrompt: prompts[i].imagePrompt, searchQuery: prompts[i].searchQuery })),
+    scenes: parts.map((p, i) => ({ narration: p, cues: [{ index: 0, tag: prompts[i].emotion }, ...sceneCues(i)], shot: i === 0 ? 'scene' : (i % 3 === 2 ? 'panel' : 'scene'), emotion: prompts[i].emotion, imagePrompt: prompts[i].imagePrompt, searchQuery: prompts[i].searchQuery, videoQuery: prompts[i].videoQuery || '' })),
   } as Script;
 }
 
 /** Hand the finished video to the app in pieces (the app keeps it for 24 hours; the device keeps a copy). */
 async function studioDeliver(S: StudioJob, meta: { title: string; durationSec: number }) {
   const size = fs.statSync(OUTPUT_VIDEO).size;
-  const start = await appRequest('POST', `/api/animate/runner/${S.id}/upload`, { size }, 30000);
-  if (!start || start.status >= 300 || !start.data?.upload) throw new PipelineError('upload_failed', `The finished video could not be handed over (${start ? `HTTP ${start.status} ${start.data?.error || ''}` : 'app unreachable'}).`);
-  const up = start.data.upload, chunk = Number(up.chunkSize) || 6 * 1024 * 1024;
-  const n = Math.max(1, Math.ceil(size / chunk));
-  const etags: string[] = new Array(n).fill('');
-  const fd = fs.openSync(OUTPUT_VIDEO, 'r');
-  try {
-    for (let i = 0; i < n; i++) {
-      const len = Math.min(chunk, size - i * chunk);
-      const buf = Buffer.alloc(len);
-      fs.readSync(fd, buf, 0, len, i * chunk);
-      for (let a = 0; a < 5 && !etags[i]; a++) {
-        try {
-          const res = await fetch(`${CFG.appUrl}${up.base}/${i}`, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'X-Animato-Runner-Key': CFG.runnerKey || '' }, body: buf, signal: AbortSignal.timeout(120000) });
-          const j: any = await res.json().catch(() => ({}));
-          if (res.ok && j.etag) etags[i] = String(j.etag); else await sleep(2000 * (a + 1));
-        } catch { await sleep(2000 * (a + 1)); }
+  let lastErr = '';
+  // The whole hand-over is retried (a fresh upload each time) so one bad moment on the app side does not lose a finished video.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) { log(`⚠️ Delivery attempt ${attempt} failed (${lastErr}); starting the upload again…`); await sleep(3000 * attempt); }
+    const start = await appRequest('POST', `/api/animate/runner/${S.id}/upload`, { size }, 30000);
+    if (!start || start.status >= 300 || !start.data?.upload) { lastErr = `start: ${start ? `HTTP ${start.status} ${start.data?.error || ''}` : 'app unreachable'}`; continue; }
+    const up = start.data.upload, chunk = Number(up.chunkSize) || 6 * 1024 * 1024;
+    const n = Math.max(1, Math.ceil(size / chunk));
+    const etags: string[] = new Array(n).fill('');
+    const fd = fs.openSync(OUTPUT_VIDEO, 'r');
+    let failed = false;
+    try {
+      for (let i = 0; i < n && !failed; i++) {
+        const len = Math.min(chunk, size - i * chunk);
+        const buf = Buffer.alloc(len);
+        fs.readSync(fd, buf, 0, len, i * chunk);
+        let why = '';
+        for (let a = 0; a < 4 && !etags[i]; a++) {
+          try {
+            const res = await fetch(`${CFG.appUrl}${up.base}/${i}`, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'X-Animato-Runner-Key': CFG.runnerKey || '' }, body: buf, signal: AbortSignal.timeout(120000) });
+            const j: any = await res.json().catch(() => ({}));
+            if (res.ok && j.etag) etags[i] = String(j.etag);
+            else { why = `HTTP ${res.status} ${j?.error || ''}`.trim(); if (res.status === 409) break; /* the app lost the upload record: start over */ await sleep(2000 * (a + 1)); }
+          } catch (e: any) { why = String(e?.message || e); await sleep(2000 * (a + 1)); }
+        }
+        if (!etags[i]) { lastErr = `piece ${i + 1}/${n}: ${why || 'no answer'}`; failed = true; break; }
+        await reportStatus('running', 'Delivering your animation', Math.min(99, 92 + Math.round((7 * (i + 1)) / n)), `Sent ${i + 1}/${n}.`);
       }
-      if (!etags[i]) throw new PipelineError('upload_failed', `Piece ${i + 1} of the video could not be sent.`);
-      await reportStatus('running', 'Delivering your animation', Math.min(99, 92 + Math.round((7 * (i + 1)) / n)), `Sent ${i + 1}/${n}.`);
-    }
-  } finally { fs.closeSync(fd); }
-  const done = await appRequest('POST', `/api/animate/runner/${S.id}/complete`, { parts: etags, size, width: W, height: H, ...meta }, 60000);
-  if (!done || done.status >= 300) throw new PipelineError('upload_failed', `The video could not be saved (${done ? `HTTP ${done.status} ${done.data?.error || ''}` : 'app unreachable'}).`);
+    } finally { fs.closeSync(fd); }
+    if (failed) continue;
+    const done = await appRequest('POST', `/api/animate/runner/${S.id}/complete`, { parts: etags, size, width: W, height: H, ...meta }, 60000);
+    if (done && done.status < 300) return;
+    lastErr = `complete: ${done ? `HTTP ${done.status} ${done.data?.error || ''}` : 'app unreachable'}`;
+  }
+  throw new PipelineError('upload_failed', `The finished video could not be delivered (${lastErr}).`);
+}
+
+async function applyStudioMusic(S: StudioJob, durationSec: number): Promise<void> {
+  if (S.musicMode === 'auto' || S.musicMode === 'none') return; // automatic score is fresh per job; none skips the score during rendering.
+  const input = OUTPUT_VIDEO;
+  const out = path.join(WORK_DIR, `studio_audio_${S.id}.mp4`);
+  if (!S.musicUrl) throw new PipelineError('music_missing', 'Background music was selected but no uploaded track was provided.');
+  const track = path.join(WORK_DIR, `studio_music_${S.id}.audio`);
+  const response = await fetch(`${CFG.appUrl.replace(/\/+$/, '')}${S.musicUrl}`, { headers: { 'X-Animato-Runner-Key': CFG.runnerKey } });
+  if (!response.ok) throw new PipelineError('music_fetch_failed', `Could not fetch uploaded background music (HTTP ${response.status}).`);
+  fs.writeFileSync(track, Buffer.from(await response.arrayBuffer()));
+  const r = await run('ffmpeg', ['-hide_banner','-loglevel','error','-y','-i',input,'-stream_loop','-1','-i',track,'-filter_complex', '[1:a]volume=0.18[bed];[0:a][bed]amix=inputs=2:duration=first:dropout_transition=2[a]','-map','0:v:0','-map','[a]','-c:v','copy','-c:a','aac','-b:a','192k','-t',String(durationSec),'-movflags','+faststart',out]);
+  if (r.code !== 0 || !fs.existsSync(out)) throw new PipelineError('music_mix_failed', 'Could not mix your background music into the video.');
+  fs.copyFileSync(out, input);
 }
 
 async function produceStudio(t0: number): Promise<number> {
@@ -4353,6 +4712,42 @@ async function produceStudio(t0: number): Promise<number> {
   await reportStatus('running', 'Preparing your animation', 6, 'Started.');
   if (S.cast[0]?.spec) CFG.characterSpec = S.cast[0].spec;
   CFG.gender = S.cast[0]?.gender || S.voiceGender;
+  CFG.targets.clear();
+  CFG.autoPost = false;
+
+  // ---- One-off music video from Tools (never an automation episode) ----
+  if (S.kind === 'musical') {
+    // The frame (9:16, 4:5 or 16:9) was chosen in the app and is already applied; the song stays a short one.
+    CFG.category = 'musical'; CFG.format = 'shorts';
+    CFG.musicalLyrics = stripScriptDirections(String(S.script || ''), 'light').slice(0, 3000);
+    CFG.musicLanguage = S.musicLanguage || 'English'; CFG.subGenre = S.subGenre || 'afrobeats';
+    CFG.stageId = S.stageMode === 'fixed' ? (S.stageId || 0) : 0;
+    CFG.topic = S.title || 'Original music video'; CFG.campaignName = S.title || 'Original music video';
+    (CFG as any).characterSpec = S.cast[0]?.spec || CFG.characterSpec;
+    await reportStatus('running', 'Creating your music video', 14, 'Generating the song, then animating your selected lead singer.');
+    const result = await produceMusical(t0, []);
+    return result;
+  }
+
+  // ---- One-off podcast from Tools (never an automation episode) ----
+  if (S.kind === 'podcast') {
+    CFG.category = 'podcast'; CFG.format = CFG.aspect === '16:9' ? 'video' : 'shorts';
+    CFG.podcastScript = stripScriptDirections(String(S.script || ''), 'light').slice(0, 8000);
+    CFG.castSpecs = Array.isArray(S.podcastHosts) && S.podcastHosts.length ? S.podcastHosts : S.cast.map((c) => c.spec).filter(Boolean);
+    CFG.studio = S.podcastStudio || CFG.studio;
+    CFG.podcastCast = 'custom'; CFG.podcastCastCount = Math.max(1, Math.min(3, CFG.castSpecs.length || 2));
+    CFG.presenterName = String(CFG.castSpecs[0]?.name || 'Host').slice(0, 32);
+    CFG.topic = S.title || 'Podcast'; CFG.campaignName = S.title || 'Podcast';
+    await reportStatus('running', 'Creating your podcast', 16, 'Preparing your selected hosts and studio.');
+    const out = await runAnimated(animKit() as any);
+    const outDur = await probeDuration(OUTPUT_VIDEO);
+    if (outDur < 2) throw new PipelineError('podcast_render_failed', `The podcast render is only ${outDur.toFixed(1)}s long.`);
+    if (S.watermark) await studioWatermark();
+    await reportStatus('running', 'Saving your podcast MP4', 92, `Rendered ${Math.round(outDur)}s.`);
+    await studioDeliver(S, { title: out.title || S.title || 'My Podcast', durationSec: Math.round(outDur) });
+    await reportStatus('completed', 'Your podcast is ready', 100, `Done in ${Math.round((Date.now() - t0) / 1000)}s.`);
+    return 0;
+  }
 
   // ---- Dialogue films: several characters talking in a place (the 2D film engine) ----
   if (S.kind === 'film') {
@@ -4372,6 +4767,7 @@ async function produceStudio(t0: number): Promise<number> {
     const out = await runAnimated(kit as any);
     const outDur = await probeDuration(OUTPUT_VIDEO);
     if (outDur < 2) throw new PipelineError('render_failed', `Rendered video is only ${outDur.toFixed(1)}s long.`);
+    await applyStudioMusic(S, outDur);
     if (S.watermark) await studioWatermark();
     await reportStatus('running', 'Delivering your animation', 92, `Rendered ${outDur.toFixed(0)}s.`);
     await studioDeliver(S, { title: out.title || S.title || 'My animation', durationSec: Math.round(outDur) });
@@ -4389,6 +4785,7 @@ async function produceStudio(t0: number): Promise<number> {
     const out = await runAnimated(animKit() as any);
     const outDur = await probeDuration(OUTPUT_VIDEO);
     if (outDur < 2) throw new PipelineError('render_failed', `Rendered video is only ${outDur.toFixed(1)}s long.`);
+    await applyStudioMusic(S, outDur);
     if (S.watermark) await studioWatermark();
     await reportStatus('running', 'Delivering your animation', 92, `Rendered ${outDur.toFixed(0)}s.`);
     await studioDeliver(S, { title: out.title || S.title || 'Stickman fight', durationSec: Math.round(outDur) });
@@ -4397,12 +4794,20 @@ async function produceStudio(t0: number): Promise<number> {
   }
 
   // ---- A talking character (with pictures behind): talk, story, kids, news, cooking, tech, ads ----
-  // A story is pictures + voice-over unless the user added a storyteller.
-  CFG.noCharacter = S.kind === 'story' && !S.showCharacter;
+  // A story is pictures + voice-over only: there is never a presenter or any character on screen.
+  CFG.noCharacter = S.kind === 'story';   // stories never show a presenter
   CFG.category = ({ story: 'stories', kids: 'stories', talk: 'tech', motivation: 'tech', news: 'news', cooking: 'cooking', tech: 'tech', ads: 'ads' } as Record<string, string>)[S.kind] || 'tech';
+  if (S.kind === 'ads') {
+    CFG.adBrief = [String(S.adBrief || '').slice(0, 12000), S.adWebsiteUrl ? `Official website: ${S.adWebsiteUrl}` : ''].filter(Boolean).join('\n\n').slice(0, 14000);
+    CFG.adImages = Array.isArray(S.adImages) ? S.adImages.slice(0, 12) : [];
+    CFG.adProfile = { company: String(S.adProfile?.company || '').slice(0, 80), service: S.adProfile?.service === true, contact: String(S.adProfile?.contact || '').slice(0, 160) } as any;
+    if (!S.adWebsiteUrl && !S.adBrief) log('Ad brief is empty; generating a conservative ad from the user script only.');
+    if (S.adWebsiteUrl) log(`Ad website supplied by the user: ${S.adWebsiteUrl}`);
+    log(`Ad brief: ${(S.adBrief || '').split(/\s+/).filter(Boolean).length} words; ${CFG.adImages.length} PDF image(s).`);
+  }
   let narration: Narration, text: string;
   // [tags] in the user's script (turns, gestures, emotions) are direction, never spoken.
-  const tagged = parseTaggedNarration(S.script || '');
+  const tagged = parseTaggedNarration(stripScriptDirections(S.script || '', CFG.category === 'stories' ? 'story' : 'light'));
   (CFG as any).studioCues = tagged.cues;
   if (S.voiceUrl) {
     ({ narration, text } = await studioVoice({ ...S, script: tagged.text }));
@@ -4424,16 +4829,19 @@ async function produceStudio(t0: number): Promise<number> {
   const times = timeScenes(script.scenes, narration.words, duration);
   const cues = timeCues(script.scenes, narration.words, times);
   await reportStatus('running', 'Finding pictures for the scenes', 45, `${script.scenes.length} scenes.`);
-  const [{ files: images, credits }, music] = await Promise.all([gatherImages(script), findMusic(duration, narration)]);
+  const [{ files: images, credits }, generatedMusic] = await Promise.all([gatherImages(script), S.musicMode === 'none' || S.musicMode === 'upload' ? Promise.resolve(null as string | null) : findMusic(duration, narration)]);
+  const music = generatedMusic;
+  const sceneVideos = await gatherSceneVideos(script, times, images);
   await reportStatus('running', 'Animating your character', 62, 'Animating.');
   const badge = S.kind === 'kids' ? 'KIDS' : S.kind === 'story' ? 'STORY' : S.kind === 'talk' || S.kind === 'motivation' ? '' : S.kind.toUpperCase();
-  const stage = await renderWithStage({ narration, scenes: script.scenes, times, cues, images, title: script.title, badge, endCard: S.watermark ? 'Made with Animato Studio Pro' : '', music, duration, credits });
+  const stage = await renderWithStage({ narration, scenes: script.scenes, times, cues, images, title: script.title, badge, endCard: S.watermark ? 'Made with Animato Studio Pro' : '', music, duration, credits, videos: sceneVideos });
   if (!stage.ok) {
     log(`⚠️ Character renderer unavailable (${stage.reason}).`);
     await renderFallback({ narration, times, images: images as string[], title: script.title, badge, music, duration });
   }
   const outDur = await probeDuration(OUTPUT_VIDEO);
   if (outDur < 2) throw new PipelineError('render_failed', `Rendered video is only ${outDur.toFixed(1)}s long.`);
+  await applyStudioMusic(S, outDur);
   if (S.watermark) await studioWatermark();
   await reportStatus('running', 'Delivering your animation', 92, `Rendered ${outDur.toFixed(0)}s.`);
   await studioDeliver(S, { title: script.title, durationSec: Math.round(outDur) });
@@ -4454,17 +4862,21 @@ async function studioWatermark() {
 
 /** The toolkit the 2D animation engine needs (shared by automations and Studio animations). */
 function animKit() {
-  const landscapePodcast = CFG.category === 'podcast' && H >= W;
+  // Automation podcasts are filmed landscape and placed in a vertical frame; a one-off podcast is drawn in the frame the person chose.
+  const landscapePodcast = CFG.category === 'podcast' && H >= W && !STUDIO;
   const RW = landscapePodcast ? 1920 : W, RH = landscapePodcast ? 1080 : H;
+  // Studio podcasts are drawn smaller and upscaled to the final frame (much faster, still sharp on a phone).
+  const drawScale = STUDIO ? (STUDIO.fast ? 0.75 : 0.6) : 1;
+  const DW = STUDIO ? Math.round(RW * drawScale / 2) * 2 : RW, DH = STUDIO ? Math.round(RH * drawScale / 2) * 2 : RH;
   return {
     hostVoice: '',
-    CFG, W: RW, H: RH, FPS, IS_SHORTS, WORK_DIR, HERE, LLM, extractJsonObject, log, reportStatus,
+    CFG, W: DW, H: DH, FPS, IS_SHORTS, WORK_DIR, HERE, LLM, extractJsonObject, log, reportStatus,
     run: (cmd: string, args: string[], o: { timeoutMs?: number } = {}) => run(cmd, args, o),
     probeDuration, pastTitles: [] as string[], PipelineError,
     composeMusic: (mood: string, seconds: number, seed: string) => composeBuffers(mood as any, Math.max(10, seconds), seed),
     automateLevel, eqForVoice,
     runStage: (o: { stageFile: string; job: any; audioFinal: string; files: Record<string, string>; duration: number }) => runStage({
-      stageFile: o.stageFile, job: { ...o.job, wardrobeSeed: `${STUDIO?.id || CFG.campaignId || 'local'}:${CFG.partNumber}` }, duration: o.duration, files: o.files, size: { w: RW, h: RH },
+      stageFile: o.stageFile, job: { ...o.job, wardrobeSeed: `${STUDIO?.id || CFG.campaignId || 'local'}:${CFG.partNumber}` }, duration: o.duration, files: o.files, size: { w: DW, h: DH }, ...(STUDIO ? { scaleTo: { w: RW, h: RH } } : {}),
       audio: { inputs: ['-i', o.audioFinal], filter: '[1:a]aresample=48000,apad[aout]' }
     })
   };
@@ -4533,6 +4945,7 @@ async function main() {
   // 1. Script
   const script = await generateScript(pastStory, pastTitles, pastSources);
   polishMetadata(script);
+  if (CFG.category === 'stories') CFG.noCharacter = true;   // stories: voice-over + captions over pictures and video, never a presenter
   if (CFG.noCharacter) for (const sc of script.scenes) sc.shot = 'full';   // pictures fill the frame; no presenter
   log(`Metadata: ${script.description.split(/\s+/).length}-word description, hashtags: ${script.hashtags.map((h) => `#${h}`).join(' ')}`);
   if (script.usedFallbackTemplate && !CFG.allowFallbackPublish) {
@@ -4556,7 +4969,8 @@ async function main() {
 
   // 3. Images, character rig, music
   const [{ files: images, aiCount, credits }, music] = await Promise.all([imagesPromise, findMusic(duration, narration)]);
-  const presenter = CFG.characterSpec ? `${CFG.characterSpec.name || 'custom'} (designed in the app)` : `default ${CFG.gender} presenter`;
+  const sceneVideos = await gatherSceneVideos(script, times, images);
+  const presenter = CFG.noCharacter ? 'none (pictures + voice-over)' : CFG.characterSpec ? `${CFG.characterSpec.name || 'custom'} (designed in the app)` : `default ${CFG.gender} presenter`;
   await reportStatus('running', '4/5 Rendering the video', 58, `${images.filter(Boolean).length} scene images ready; character: ${presenter}.`);
 
   // 4. Render
@@ -4573,7 +4987,7 @@ async function main() {
   // the same way a landscape podcast is framed into a Short (see landscapeIntoFrame).
   const adLandscapeShort = CFG.category === 'ads' && IS_SHORTS;
   const renderSize = adLandscapeShort ? { w: 1920, h: 1080 } : undefined;
-  const stage = await renderWithStage({ narration, scenes: script.scenes, times, cues, images, title, badge, endCard, music, duration, credits, size: renderSize });
+  const stage = await renderWithStage({ narration, scenes: script.scenes, times, cues, images, title, badge, endCard, music, duration, credits, videos: sceneVideos, size: renderSize });
   let characterMode = stage.character;
   if (!stage.ok) {
     log(`⚠️ Character renderer unavailable (${stage.reason}). Rendering scenes + captions without the character.`);
