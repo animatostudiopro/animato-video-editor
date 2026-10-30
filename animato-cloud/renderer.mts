@@ -267,6 +267,30 @@ const PROCESS_T0 = Date.now();
 const jobMinutesLeft = () => (parseInt(process.env.JOB_TIMEOUT_MINUTES || '60', 10) || 60) - 3 - (Date.now() - PROCESS_T0) / 60000;
 const IS_SHORTS = CFG.format === 'shorts';
 
+/**
+ * Video encoder settings. Automation posts are what viewers actually watch on YouTube and social,
+ * so they are encoded near-visually-lossless (CRF 17, a generous bitrate ceiling). The preset stays "veryfast":
+ * the encoder shares the runner's CPU with Chrome, and a slower preset slows the whole render down.
+ * One-off studio jobs keep the faster settings.
+ */
+const X264_QUALITY: string[] = STUDIO
+  ? ['-preset', 'veryfast', '-crf', '20']
+  : ['-preset', 'veryfast', '-crf', '17', '-maxrate', '18M', '-bufsize', '36M'];
+/** Tag the picture as HD (BT.709) so every player shows the colours the way they were drawn. */
+const COLOR_TAGS = ['-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709'];
+/** Audio bitrate for the finished video (higher for automation: music videos are mostly sound). */
+const AUDIO_BITRATE = STUDIO ? '192k' : '256k';
+/**
+ * A different outfit, jewelry and hairstyle in every video of an automation (see wardrobeVariant).
+ * The part number always comes last so the wardrobe can walk through its looks one video at a time.
+ * Story arcs restart their part number for every new story, so the story's topic joins the key.
+ */
+const wardrobeKey = (): string => {
+  const campaign = CFG.campaignId || CFG.campaignName || 'local';
+  const arc = CFG.category === 'stories' && CFG.topic ? `:${crypto.createHash('md5').update(String(CFG.topic)).digest('hex').slice(0, 8)}` : '';
+  return `${campaign}${arc}:${CFG.partNumber}`;
+};
+
 class PipelineError extends Error {
   code: string;
   constructor(code: string, message: string) {
@@ -966,6 +990,21 @@ ${part >= last ? '- The title must NOT contain "(Part ...)" if the story ends he
   }
 }
 
+/**
+ * The reach playbook every writer prompt carries. Nothing can guarantee views, so this does not promise them;
+ * it makes each video as strong as it can be on the things that actually drive watch time, shares and search.
+ */
+const REACH_PLAYBOOK = `MAKE IT SPREAD (what separates videos people finish and share from videos people swipe past)
+- THE FIRST 2 SECONDS decide everything. Scene 1 must open mid-action on the single most surprising, valuable or emotional fact, a bold specific claim, or a question the viewer needs answered. Never start with a greeting, a channel intro, "today we", "have you ever wondered" or background. Lead with the payoff, then earn it.
+- OPEN A LOOP, THEN PAY IT OFF. Tease one concrete thing the viewer will only learn at the end ("and the third one is the reason it works"), and deliver it in the last scene. Re-hook every 2-3 scenes with a twist, a number, a contrast or a new question so there is never a flat stretch.
+- ONE IDEA, ONE EMOTION. Pick a single dominant feeling (awe, curiosity, outrage, fear, joy, nostalgia, "I need to know") and build every scene toward it. Be specific: real names, exact numbers, concrete details beat vague claims every time.
+- PACE. Cut every filler word and every sentence that does not add a new fact, feeling or turn. Short lines, active verbs, no throat-clearing. Vary the rhythm so it never drones.
+- THE ENDING EARNS THE REPLAY AND THE SHARE. Land a clean payoff, then close with a line that makes the viewer want to send it to someone, argue in the comments or watch again (a take people will disagree with, a "tag the person who..." moment, or an ending that loops back to the first line). One specific call to action only.
+- THE TITLE is a promise the video keeps: 45-70 characters, the main search keyword near the front, one specific curiosity gap or benefit, a real number or name when there is one. It must be completely true to the video. No false clickbait (it destroys retention and gets videos suppressed).
+- THE DESCRIPTION: the first 2 lines are what shows before "more", so put the hook and the main keyword there, then useful detail that matches what is said, then a comment-bait question.
+- HASHTAGS: only specific ones for this exact subject and niche (people, product, place, topic) that people really search. The first 3 appear above the title, so make them the most specific and searchable. Never use reach-bait like #viral or #fyp; it signals spam and brings the wrong audience.
+- Never invent facts, quotes, statistics or events. Everything stated must be true or clearly framed as opinion or speculation.`;
+
 function buildPrompt(pastStory: string, pastTitles: string[], headlines: any[], pack: FactPack | null = null): string {
   const L = lengthSpec();
   const avoid = pastTitles.length ? `\nPrevious video titles (do NOT repeat these topics): ${pastTitles.slice(-35).join(' | ')}` : '';
@@ -977,6 +1016,8 @@ RULES
 - Write for the ear: short sentences, concrete words, no emojis, no hashtags, no stage directions, no "In this video".
 - Suitable for a general YouTube audience (PG-13): tension and mystery are great; no gore, no graphic violence, no self-harm, nothing sexual.
 - Every scene gets its own image that shows exactly what is being said at that moment.
+
+${REACH_PLAYBOOK}
 
 PERFORMANCE TAGS (the presenter is an animated character with a face, head, arms and hands; it performs tags you write INSIDE "narration")
 - Put a tag right before the word where the change should land. Tags are never spoken or shown as captions.
@@ -1345,7 +1386,7 @@ async function generateScript(pastStory: string, pastTitles: string[], pastSourc
   const headlines = (CFG.category === 'tech' || CFG.category === 'news') ? await recentHeadlines(pastTitles, pastSources) : [];
   const pack = CFG.category === 'stories' ? null : await researchFor(pastTitles, headlines);
   const prompt = buildPrompt(pastStory, pastTitles, pack?.headline ? [pack.headline] : headlines, pack);
-  const system = 'You are an award-winning short-form video writer and director. Your videos open with an irresistible hook, make complete sense, stay engaging every single second and end with a reason to follow. You answer with one valid JSON object and nothing else.';
+  const system = 'You are a top-performing short-form video strategist, writer and director whose videos consistently earn high retention, shares and comments. You obsess over the first two seconds, curiosity loops, specific details, relentless pacing and a payoff that makes people share. You package every video with a keyword-rich, honest title, a strong description and precise hashtags. You never invent facts and never use misleading clickbait. You answer with one valid JSON object and nothing else.';
   let nearMiss: { script: Script; words: number } | null = null;
   let lastError = '';
   const withSources = (sc: Script) => {
@@ -2691,9 +2732,10 @@ async function pexelsVideos(query: string): Promise<{ id: number; url: string; c
   for (const v of d?.videos || []) {
     const files = (v.video_files || []).filter((f: any) => f?.link && /mp4/i.test(String(f.file_type || '')) && f.width && f.height);
     if (!files.length || Number(v.duration) < 3) continue;
-    // About 720 px on the short side is plenty (smaller download, quicker to seek in the renderer).
+    // Studio jobs: about 720 px on the short side is plenty (quicker). Automation posts: full HD (1080 px) so footage stays sharp.
     const short = (f: any) => Math.min(f.width, f.height);
-    const best = files.slice().sort((a: any, b: any) => Math.abs(short(a) - 720) - Math.abs(short(b) - 720))[0];
+    const target = STUDIO ? 720 : 1080;
+    const best = files.slice().sort((a: any, b: any) => Math.abs(short(a) - target) - Math.abs(short(b) - target))[0];
     out.push({ id: Number(v.id), url: best.link, desc: String(v.url || '').replace(/^.*\/video\//, '').replace(/-\d+\/?$/, '').replace(/[-_/]+/g, ' ').toLowerCase(), credit: `Video: ${String(v.user?.name || 'Pexels').slice(0, 24)} · Pexels`, attribution: `Video by ${v.user?.name || 'unknown'} on Pexels (Pexels License) — ${v.url || 'https://www.pexels.com'}` });
   }
   return out;
@@ -2705,7 +2747,7 @@ async function pixabayVideos(query: string): Promise<{ id: number; url: string; 
   const d = await fetchJson(`https://pixabay.com/api/videos/?key=${encodeURIComponent(CFG.pixabayKey)}&q=${encodeURIComponent(query.trim())}&per_page=8&safesearch=true`);
   const out: { id: number; url: string; credit: string; attribution: string; desc: string }[] = [];
   for (const v of d?.hits || []) {
-    const f = v?.videos?.medium?.url ? v.videos.medium : v?.videos?.small?.url ? v.videos.small : v?.videos?.large;
+    const f = !STUDIO && v?.videos?.large?.url ? v.videos.large : v?.videos?.medium?.url ? v.videos.medium : v?.videos?.small?.url ? v.videos.small : v?.videos?.large;
     if (!f?.url || Number(v.duration) < 3) continue;
     // Offset the id so a Pixabay clip can never collide with a Pexels one in the "already used" set.
     out.push({ id: 1_000_000_000 + Number(v.id), url: f.url, desc: String(v.tags || '').replace(/[,]+/g, ' ').toLowerCase(), credit: `Video: ${String(v.user || 'Pixabay').slice(0, 24)} · Pixabay`, attribution: `Video by ${v.user || 'unknown'} on Pixabay (Pixabay License) — ${v.pageURL || 'https://pixabay.com'}` });
@@ -2794,7 +2836,8 @@ async function gatherSceneVideos(script: Script, times: { start: number; end: nu
   const STOP = new Set(['the', 'and', 'with', 'from', 'that', 'this', 'into', 'over', 'under', 'their', 'there', 'then', 'they', 'was', 'were', 'his', 'her', 'she', 'him', 'for', 'but', 'not', 'all', 'one', 'had', 'has', 'have', 'who', 'what', 'when', 'where', 'very', 'just', 'once', 'upon', 'time']);
   const kw = (t: string, k: number) => String(t || '').replace(/[^\p{L}\p{N}\s'-]/gu, ' ').split(/\s+/).filter((w) => w.length > 2 && !STOP.has(w.toLowerCase())).slice(0, k).join(' ');
   const topic = kw((script.title || '').replace(/\s*\(part \d+\)\s*$/i, ''), 4);
-  const cw = Math.round(W * Math.min(1, 720 / Math.min(W, H)) / 2) * 2, ch = Math.round(H * Math.min(1, 720 / Math.min(W, H)) / 2) * 2;
+  const clipShort = STUDIO ? 720 : 1080;   // automation posts keep stock footage at full HD
+  const cw = Math.round(W * Math.min(1, clipShort / Math.min(W, H)) / 2) * 2, ch = Math.round(H * Math.min(1, clipShort / Math.min(W, H)) / 2) * 2;
   // Stories: every scene gets footage that fits what the narrator says, cut together into one moving film.
   // Ads keep a blend (two of every three scenes are footage, the rest stay pictures).
   const wanted = script.scenes.map((_, i) => isStory || i % 3 !== 2);
@@ -2818,7 +2861,7 @@ async function gatherSceneVideos(script: Script, times: { start: number; end: nu
         if (!(await download(v.url, raw, 60000))) continue;
         const r = await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-stream_loop', '-1', '-i', raw, '-t', len.toFixed(2),
           '-vf', `scale=${cw}:${ch}:force_original_aspect_ratio=increase,crop=${cw}:${ch},fps=${FPS},setsar=1`,
-          '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '27', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', clip], { timeoutMs: 120000 });
+          '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', STUDIO ? '25' : '18', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', clip], { timeoutMs: 120000 });
         try { fs.rmSync(raw, { force: true }); } catch {}
         if (r.code !== 0 || !fs.existsSync(clip) || (await probeDuration(clip)) < 1) continue;
         used.add(v.id);
@@ -2953,7 +2996,7 @@ function audioArgs(narration: string, music: string | null, firstInput: number):
   return { inputs, filter };
 }
 
-async function renderWithStage(opts: {
+async function renderWithStageOnce(opts: {
   narration: Narration; scenes: Scene[]; times: { start: number; end: number }[]; cues: { t: number; tag: string }[]; images: (string | null)[];
   title: string; badge: string; endCard: string; music: string | null; duration: number; credits?: (string | null)[]; videos?: (string | null)[]; musicalStage?: boolean; chorusIntervals?: { start: number; end: number }[];
   /** Override the canvas the stage renders at (used for ads that render landscape then get framed into a Short — see adLandscapeShort). Defaults to the job's actual frame. */
@@ -2961,13 +3004,15 @@ async function renderWithStage(opts: {
   musical?: { mood?: string; stageId?: number; stageAutoSeed?: string; style?: string; sections?: { start: number; end: number; tag: string; emotion?: string }[]; vocalSpans?: { start: number; end: number }[]; drumLevel?: number; keysLevel?: number };
   stems?: Stems;
   lyrics?: { lines: { text: string; en: string }[]; noSpaces: boolean };
-}): Promise<{ ok: boolean; character: string; reason?: string }> {
+}, scaleOverride?: number): Promise<{ ok: boolean; character: string; reason?: string; tooSlowRatio?: number; scaleUsed: number }> {
   const audioExt = path.extname(opts.narration.audioPath) || '.mp3';
   const accent = CFG.category === 'cooking' ? '#FFB020' : CFG.category === 'tech' ? '#22D3EE' : CFG.category === 'news' ? '#FF4D4D' : '#FFD23F';
   // Musicals (a full concert, every frame) render at 75% size and are upscaled — about twice as fast.
   // Studio videos are drawn at 60-75% size and upscaled: far fewer pixels to draw and move for every frame.
-  const drawScale = STUDIO ? (STUDIO.fast ? 0.75 : 0.6) : 0.75;
-  const fast = !!opts.musicalStage && !opts.size && (!!STUDIO || W * H > 1280 * 720);
+  // Automation posts are drawn at FULL size (no upscaling blur) unless the song is very long (then 85% so the job still finishes in time).
+  // If the render turns out too slow for the job's time limit, renderWithStage() starts again a little smaller (scaleOverride).
+  const drawScale = scaleOverride ?? (STUDIO ? (STUDIO.fast ? 0.75 : 0.6) : opts.duration > 300 ? 0.85 : 1);
+  const fast = !opts.size && (STUDIO ? !!opts.musicalStage : drawScale < 1);
   const drawSize = fast ? { w: Math.round(W * drawScale / 2) * 2, h: Math.round(H * drawScale / 2) * 2 } : opts.size;
   const RW = drawSize?.w || W, RH = drawSize?.h || H;
   const job = {
@@ -2986,7 +3031,7 @@ async function renderWithStage(opts: {
     // Stories can be pictures + voice-over only (no presenter on screen).
     noCharacter: !!CFG.noCharacter,
     // A different outfit (same person) in every video of this automation.
-    wardrobeSeed: `${CFG.campaignId || CFG.campaignName || 'local'}:${CFG.partNumber}`,
+    wardrobeSeed: wardrobeKey(),
     ...(opts.musical ? { musical: opts.musical, musicalStyle: opts.musical.style || '' } : {}),
     // Isolated stems (when separation worked): vocals drive the lip sync, drums the drummer, other the pianist.
     ...(opts.stems ? { lipAudio: '/audio/vocals.wav', ...(opts.stems.drums ? { drumsAudio: '/audio/drums.wav' } : {}), ...(opts.stems.other ? { keysAudio: '/audio/other.wav' } : {}) } : {}),
@@ -3000,16 +3045,34 @@ async function renderWithStage(opts: {
     stageFile: 'stage.js', job, duration: opts.duration,
     audio: audioArgs(opts.narration.audioPath, opts.music, 1),
     files: { [`/audio/narration${audioExt2}`]: opts.narration.audioPath, ...(opts.stems ? { '/audio/vocals.wav': opts.stems.vocals, ...(opts.stems.drums ? { '/audio/drums.wav': opts.stems.drums } : {}), ...(opts.stems.other ? { '/audio/other.wav': opts.stems.other } : {}) } : {}) },
-    size: drawSize, scaleTo: fast ? { w: W, h: H } : undefined
+    size: drawSize, scaleTo: fast ? { w: W, h: H } : undefined,
+    canBail: !STUDIO && !opts.size && drawScale > 0.55
   });
-  return { ok: r.ok, character: r.character || 'none', reason: r.reason };
+  return { ok: r.ok, character: r.character || 'none', reason: r.reason, tooSlowRatio: r.tooSlowRatio, scaleUsed: fast ? drawScale : 1 };
+}
+
+/**
+ * Renders the stage. Automation videos are drawn at full quality first; if the first minute shows the
+ * render could not finish inside the job's time limit, it restarts a little smaller (up to twice, never
+ * below half size) and is stretched back to the full frame — a slightly softer video that POSTS beats a
+ * perfect one that times out and crashes the automation.
+ */
+async function renderWithStage(opts: Parameters<typeof renderWithStageOnce>[0]): Promise<{ ok: boolean; character: string; reason?: string }> {
+  let scale: number | undefined;
+  for (let attempt = 0; ; attempt++) {
+    const r = await renderWithStageOnce(opts, scale);
+    if (r.ok || !r.tooSlowRatio || attempt >= 2 || r.scaleUsed <= 0.55) return { ok: r.ok, character: r.character, reason: r.reason };
+    scale = Math.max(0.5, +(r.scaleUsed * Math.sqrt(1 / r.tooSlowRatio) * 0.9).toFixed(2));
+    log(`⏱️ Too slow for the job's time limit at ${Math.round(r.scaleUsed * 100)}% draw size — starting again at ${Math.round(scale * 100)}% (stretched back to full size).`);
+    reportStatus('running', '4/5 Rendering the video (speeding up)', 60, '').catch?.(() => {});
+  }
 }
 
 /**
  * Runs a stage bundle (stage.js: the presenter; anim.js: podcasts, films,
  * stickman) in headless Chrome and encodes its frames with the given audio.
  */
-async function runStage(opts: { stageFile: string; job: any; duration: number; audio: { inputs: string[]; filter: string } | null; files: Record<string, string>; size?: { w: number; h: number }; imageOut?: string; scaleTo?: { w: number; h: number } }): Promise<{ ok: boolean; character?: string; reason?: string }> {
+async function runStage(opts: { stageFile: string; job: any; duration: number; audio: { inputs: string[]; filter: string } | null; files: Record<string, string>; size?: { w: number; h: number }; imageOut?: string; scaleTo?: { w: number; h: number }; canBail?: boolean }): Promise<{ ok: boolean; character?: string; reason?: string; tooSlowRatio?: number }> {
   const W = opts.size?.w || FRAME_W, H = opts.size?.h || FRAME_H;
   const chrome = findChrome();
   if (!chrome) return { ok: false, character: 'none', reason: 'Chrome not found on the runner' };
@@ -3026,9 +3089,10 @@ async function runStage(opts: { stageFile: string; job: any; duration: number; a
     '-f', 'rawvideo', '-pix_fmt', 'rgba', '-s', `${W}x${H}`, '-r', String(FPS), '-i', 'pipe:0',
     ...aud.inputs, '-filter_complex', aud.filter, '-map', '0:v', '-map', '[aout]',
     // Rendered smaller for speed (musicals) → upscaled to the final frame here.
-    ...(opts.scaleTo ? ['-vf', `scale=${opts.scaleTo.w}:${opts.scaleTo.h}:flags=lanczos`] : []),
-    '-t', opts.duration.toFixed(3), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-profile:v', 'high',
-    '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-movflags', '+faststart', OUTPUT_VIDEO];
+    // RGB frames -> HD YUV with the BT.709 matrix (the default matrix shifts colours), scaled up with lanczos if drawn smaller.
+    '-vf', `scale=${opts.scaleTo ? `${opts.scaleTo.w}:${opts.scaleTo.h}:` : ''}flags=lanczos+accurate_rnd+full_chroma_int:out_color_matrix=bt709:out_range=tv,format=yuv420p`,
+    '-t', opts.duration.toFixed(3), '-c:v', 'libx264', ...X264_QUALITY, '-pix_fmt', 'yuv420p', '-profile:v', 'high', ...COLOR_TAGS,
+    '-c:a', 'aac', '-b:a', AUDIO_BITRATE, '-ar', '48000', '-movflags', '+faststart', OUTPUT_VIDEO];
   const ff = spawn('ffmpeg', ffArgs, { stdio: ['pipe', 'ignore', 'pipe'] });
   let ffErr = '';
   ff.stderr.on('data', (d: Buffer) => { ffErr += d.toString(); if (ffErr.length > 20000) ffErr = ffErr.slice(-10000); });
@@ -3043,8 +3107,8 @@ async function runStage(opts: { stageFile: string; job: any; duration: number; a
   };
 
   let framesWritten = 0;
-  let finished: ((r: { ok: boolean; reason?: string; character?: string }) => void) | null = null;
-  const result = new Promise<{ ok: boolean; reason?: string; character?: string }>((resolve) => { finished = resolve; });
+  let finished: ((r: { ok: boolean; reason?: string; character?: string; tooSlowRatio?: number }) => void) | null = null;
+  const result = new Promise<{ ok: boolean; reason?: string; character?: string; tooSlowRatio?: number }>((resolve) => { finished = resolve; });
   let lastProgressReport = 0;
   let pageErrors = 0;
 
@@ -3097,7 +3161,7 @@ async function runStage(opts: { stageFile: string; job: any; duration: number; a
 
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'animato-chrome-'));
   const chromeArgs = ['--headless=new', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--no-first-run', '--no-default-browser-check',
-    '--disable-extensions', '--mute-audio', '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
+    '--disable-extensions', '--disable-background-networking', '--disable-sync', '--disable-default-apps', '--disable-component-update', '--disable-hang-monitor', '--metrics-recording-only', '--mute-audio', '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
     '--disable-backgrounding-occluded-windows', '--autoplay-policy=no-user-gesture-required', `--user-data-dir=${profile}`,
     '--remote-debugging-port=0', '--window-size=1280,800', '--js-flags=--max-old-space-size=4096', `http://127.0.0.1:${port}/`];
   const browser = spawn(chrome, chromeArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -3115,6 +3179,13 @@ async function runStage(opts: { stageFile: string; job: any; duration: number; a
     const mins = ((Date.now() - startedAt) / 60000).toFixed(1);
     if (Date.now() - lastMoveAt > 120_000) finished?.({ ok: false, reason: `stage stalled (no frame for 2 min) after ${mins} min (${framesWritten}/${totalFrames} frames)` });
     else if (jobMinutesLeft() < 4) finished?.({ ok: false, reason: `out of job time after ${mins} min of rendering (${framesWritten}/${totalFrames} frames)` });
+    else if (opts.canBail && framesWritten >= 200) {
+      // Will this render finish in time? (the last ~10 minutes of the job are kept for finishing, the upload and posting)
+      const elapsedMin = (Date.now() - startedAt) / 60000;
+      const projectedMin = (elapsedMin / framesWritten) * totalFrames;
+      const availableMin = jobMinutesLeft() + elapsedMin - 10;
+      if (projectedMin > availableMin * 0.97) finished?.({ ok: false, reason: `too slow: ${projectedMin.toFixed(0)} min needed, ${availableMin.toFixed(0)} min available`, tooSlowRatio: Math.max(1.05, projectedMin / Math.max(1, availableMin)) });
+    }
   }, 10_000);
   const outcome = await result;
   clearInterval(timer);
@@ -3125,7 +3196,7 @@ async function runStage(opts: { stageFile: string; job: any; duration: number; a
   if (!outcome.ok || framesWritten < totalFrames * 0.98) {
     try { ff.kill('SIGKILL'); } catch {}
     await ffDone;
-    return { ok: false, character: 'none', reason: outcome.reason || `only ${framesWritten}/${totalFrames} frames rendered` };
+    return { ok: false, character: 'none', reason: outcome.reason || `only ${framesWritten}/${totalFrames} frames rendered`, tooSlowRatio: outcome.tooSlowRatio };
   }
   ff.stdin.end();
   const code = await ffDone;
@@ -3159,7 +3230,7 @@ async function renderFallback(opts: { narration: Narration; times: { start: numb
   const vf = `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,fps=${FPS},subtitles=filename='${ass}':fontsdir='${path.join(HERE, 'assets/fonts')}',format=yuv420p[vout]`;
   const r = await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', list, ...aud.inputs,
     '-filter_complex', `${vf};${aud.filter}`, '-map', '[vout]', '-map', '[aout]', '-t', opts.duration.toFixed(3),
-    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', OUTPUT_VIDEO], { timeoutMs: 20 * 60 * 1000 });
+    '-c:v', 'libx264', ...X264_QUALITY, '-pix_fmt', 'yuv420p', ...COLOR_TAGS, '-c:a', 'aac', '-b:a', AUDIO_BITRATE, '-movflags', '+faststart', OUTPUT_VIDEO], { timeoutMs: 20 * 60 * 1000 });
   if (r.code !== 0) throw new PipelineError('render_failed', `FFmpeg failed: ${r.stderr.trim().split('\n').slice(-4).join(' | ')}`);
 }
 
@@ -3337,7 +3408,7 @@ async function produceAnimated(t0: number, pastTitles: string[]): Promise<number
     composeMusic: (mood: string, seconds: number, seed: string) => composeBuffers(mood as any, Math.max(10, seconds), seed),
     automateLevel, eqForVoice,
     runStage: (o: { stageFile: string; job: any; audioFinal: string; files: Record<string, string>; duration: number }) => runStage({
-      stageFile: o.stageFile, job: { ...o.job, wardrobeSeed: `${CFG.campaignId || CFG.campaignName || 'local'}:${CFG.partNumber}` }, duration: o.duration, files: o.files, size: { w: RW, h: RH },
+      stageFile: o.stageFile, job: { ...o.job, wardrobeSeed: wardrobeKey() }, duration: o.duration, files: o.files, size: { w: RW, h: RH },
       audio: { inputs: ['-i', o.audioFinal], filter: '[1:a]aresample=48000,apad[aout]' }
     })
   };
@@ -3441,7 +3512,7 @@ async function landscapeIntoFrame(showName: string): Promise<void> {
     ? `,drawtext=fontfile='${font}':textfile='${nameFile}':fontcolor=white:fontsize=${Math.round(W * 0.06)}:x=(w-text_w)/2:y=${Math.max(20, top - Math.round(W * 0.12))}:shadowcolor=black@0.6:shadowx=2:shadowy=3`
     : '';
   const filter = `[0:v]split=2[a][b];[a]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},boxblur=28:2,eq=brightness=-0.22:saturation=1.15[bg];[b]scale=${W}:${fgH}[fg];[bg][fg]overlay=0:${top}${text}[v]`;
-  const r = await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', src, '-filter_complex', filter, '-map', '[v]', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-movflags', '+faststart', OUTPUT_VIDEO], { timeoutMs: 20 * 60 * 1000 });
+  const r = await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', src, '-filter_complex', filter, '-map', '[v]', '-map', '0:a?', '-c:v', 'libx264', ...X264_QUALITY, '-pix_fmt', 'yuv420p', ...COLOR_TAGS, '-c:a', 'copy', '-movflags', '+faststart', OUTPUT_VIDEO], { timeoutMs: 20 * 60 * 1000 });
   if (r.code !== 0 || !fs.existsSync(OUTPUT_VIDEO)) {
     log(`⚠️ Could not place the landscape podcast in the vertical frame (${r.stderr.trim().split('\n').slice(-1)[0]}) — posting it as a landscape video.`);
     fs.renameSync(src, OUTPUT_VIDEO);
@@ -4855,7 +4926,7 @@ async function studioWatermark() {
   const font = [path.join(HERE, 'assets', 'Poppins-Bold.ttf'), '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'].find((f) => fs.existsSync(f));
   const fontArg = font ? `fontfile='${font.replace(/'/g, "\\'")}':` : '';
   const size = Math.round(Math.min(W, H) * 0.028);
-  const r = await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', OUTPUT_VIDEO, '-vf', `drawtext=${fontArg}text='Animato Studio Pro':fontcolor=white@0.78:fontsize=${size}:borderw=2:bordercolor=black@0.35:x=w-tw-${Math.round(size * 0.9)}:y=${Math.round(size * 1.1)}`, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p', '-c:a', 'copy', '-movflags', '+faststart', tmp], { timeoutMs: 20 * 60_000 });
+  const r = await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', OUTPUT_VIDEO, '-vf', `drawtext=${fontArg}text='Animato Studio Pro':fontcolor=white@0.78:fontsize=${size}:borderw=2:bordercolor=black@0.35:x=w-tw-${Math.round(size * 0.9)}:y=${Math.round(size * 1.1)}`, '-c:v', 'libx264', ...X264_QUALITY, '-pix_fmt', 'yuv420p', ...COLOR_TAGS, '-c:a', 'copy', '-movflags', '+faststart', tmp], { timeoutMs: 20 * 60_000 });
   if (r.code === 0 && fs.existsSync(tmp) && fs.statSync(tmp).size > 10000) fs.renameSync(tmp, OUTPUT_VIDEO);
   else log(`Watermark skipped: ${r.stderr.slice(-200)}`);
 }
@@ -4876,7 +4947,7 @@ function animKit() {
     composeMusic: (mood: string, seconds: number, seed: string) => composeBuffers(mood as any, Math.max(10, seconds), seed),
     automateLevel, eqForVoice,
     runStage: (o: { stageFile: string; job: any; audioFinal: string; files: Record<string, string>; duration: number }) => runStage({
-      stageFile: o.stageFile, job: { ...o.job, wardrobeSeed: `${STUDIO?.id || CFG.campaignId || 'local'}:${CFG.partNumber}` }, duration: o.duration, files: o.files, size: { w: DW, h: DH }, ...(STUDIO ? { scaleTo: { w: RW, h: RH } } : {}),
+      stageFile: o.stageFile, job: { ...o.job, wardrobeSeed: STUDIO ? `${STUDIO.id}:${CFG.partNumber}` : wardrobeKey() }, duration: o.duration, files: o.files, size: { w: DW, h: DH }, ...(STUDIO ? { scaleTo: { w: RW, h: RH } } : {}),
       audio: { inputs: ['-i', o.audioFinal], filter: '[1:a]aresample=48000,apad[aout]' }
     })
   };

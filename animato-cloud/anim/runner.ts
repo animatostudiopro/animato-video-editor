@@ -42,6 +42,8 @@ export interface Kit {
 export interface Highlight { t: number; w: number }
 const STRONG = new Set(['excited', 'surprised', 'laugh', 'happy', 'angry', 'scared', 'crying', 'shocked']);
 const emotionMoments = (cues: Record<string, { t: number; tag: string }[]>, w = 0.6): Highlight[] => Object.values(cues).flat().filter((c) => STRONG.has(c.tag)).map((c) => ({ t: c.t, w }));
+/** Reach rules every anim writer carries. Nothing can guarantee views; this maximises retention, shares and search. */
+const REACH_RULES = 'REACH RULES: the first 2 seconds must open on the most surprising or emotional moment (never a greeting or setup); open one curiosity loop early and pay it off at the end; re-hook every few beats with a twist, number or contrast; no filler lines; end on a payoff that makes people share, replay or argue in the comments. Title: honest, specific, main keyword first, with a curiosity gap (no false clickbait). Description: first two lines carry the hook and the keyword, then a comment-bait question. Hashtags: 5-8 specific to this exact subject and niche, most searchable first; never #viral, #fyp or other reach-bait. Never invent facts.';
 export interface AnimResult { title: string; description: string; hashtags: string[]; tags: string[]; script: string; durationSec: number; character: string; model: string; sources: string[]; showName?: string; highlights?: Highlight[] }
 
 const SR = 48000;
@@ -374,16 +376,17 @@ const AUTO_PERSONALITIES = ['warm and funny', 'sharp skeptic', 'hype energy', 'c
 /** A brand-new cast for one episode: names, genders, personalities and face seeds (deterministic per episode). */
 function autoCast(seed: string, n: number, avoid: string[] = []): { autoHost: true; name: string; gender: 'female' | 'male'; personality: string; seed: string }[] {
   let h = 2166136261; for (let i = 0; i < seed.length; i++) { h ^= seed.charCodeAt(i); h = Math.imul(h, 16777619); }
-  const r = () => { h = Math.imul(h ^ (h >>> 13), 0x5bd1e995) >>> 0; h ^= h >>> 15; return (h % 100000) / 100000; };
+  const r = () => { h = Math.imul(h ^ (h >>> 13), 0x5bd1e995) >>> 0; h ^= h >>> 15; h >>>= 0; return (h % 100000) / 100000; };
   const out: { autoHost: true; name: string; gender: 'female' | 'male'; personality: string; seed: string }[] = [];
   const used = new Set(avoid.map((x) => String(x ?? '').toLowerCase()));
   const usedP = new Set<string>();
   for (let i = 0; i < n; i++) {
     const gender: 'female' | 'male' = i === 0 ? (r() < 0.5 ? 'female' : 'male') : (out[i - 1].gender === 'female' ? (r() < 0.7 ? 'male' : 'female') : (r() < 0.7 ? 'female' : 'male'));
     const list = AUTO_NAMES[gender];
-    let name = list[Math.floor(r() * list.length)];
-    for (let k = 0; k < 10 && used.has(name.toLowerCase()); k++) name = list[Math.floor(r() * list.length)];
-    used.add(name.toLowerCase());
+    const pick = () => list[Math.min(list.length - 1, Math.max(0, Math.floor(r() * list.length)))] || list[0] || 'Alex';
+    let name = pick();
+    for (let k = 0; k < 10 && used.has(String(name).toLowerCase()); k++) name = pick();
+    used.add(String(name).toLowerCase());
     let personality = AUTO_PERSONALITIES[Math.floor(r() * AUTO_PERSONALITIES.length)];
     for (let k = 0; k < 6 && usedP.has(personality); k++) personality = AUTO_PERSONALITIES[Math.floor(r() * AUTO_PERSONALITIES.length)];
     usedP.add(personality);
@@ -596,13 +599,14 @@ ${songs.length ? songs.map((x, i) => `${i + 1}. "${x.title}"${x.genre ? ` (${x.g
 INTERVIEW: for every song the hosts ask about the INSPIRATION — the moment, person or feeling behind it, what the lyrics really mean (she may quote one short line ONLY from the lyrics given above), how the band and backup singers built it, and how the crowd reacted at the concert. Follow-up questions, laughs and honest emotion. ${star.name} speaks about 45% of the lines, each host about a quarter. End with what she is working on next, the hosts thank ${star.name} by name and ask viewers to follow.
 Never invent awards, chart positions, sales or real collaborators.
 ` : ''}${about && !CFG.topic && !singerMode ? `ANGLE: a roundup of the latest in ${about} — what just happened, why it matters, the hosts' honest takes, and bold predictions about the next big thing (clearly framed as speculation).\n` : ''}HOW IT SOUNDS: a real conversation between friends who know the subject — quick back-and-forth, reactions ("wait, really?"), a disagreement, a laugh, a clear takeaway. Short lines (one or two sentences each). Line 1 is a HOOK (a surprising fact or bold opinion, max 14 words). The last line thanks the audience and asks them to follow.
+${REACH_RULES}
 The hosts talk TO EACH OTHER, never to the camera: they react to what the other just said, ask each other questions and answer them. Only line 1 (welcome) and the last line (thanks / follow) may address the viewers. Stay strictly on the TOPIC above.
 Performance tags go before the word they apply to: start most lines with one emotion tag and put a gesture on about every second line: ${[...EMO_TAGS, 'nod', 'shake_head', 'lean_in', 'point', 'explain', 'count', 'shrug', 'hands_up', 'hand_chest', 'think'].map((t) => `[${t}]`).join(' ')}. Do NOT write turn / look / face tags: the hosts turn their heads toward each other automatically.
 ${CFG.performanceNotes ? `WHAT IS WORKING ON THIS CHANNEL (learn from it):\n${CFG.performanceNotes}\n` : ''}LENGTH: ${n}.
 ${foreign
   ? `Return ONLY JSON: {"title": "catchy episode title in ${lang!.name} (max 60 chars)", "title_en": "the same title in English", "description": "2-3 sentences for YouTube, in English", "hashtags": ["5-8 specific hashtags without #"], "lines": [{"host": 1, "text": "[excited] the line in ${lang!.name}", "en": "the English translation"}]}`
   : `Return ONLY JSON: {"title": "catchy episode title (max 70 chars)", "description": "2-3 sentences for YouTube", "hashtags": ["5-8 specific hashtags without #"], "lines": [{"host": 1, "text": "[excited] Line text"}]}`}`;
-  const got = manualPodcastScript ? null : await askJson(kit, 'You write natural, factual podcast conversations. You answer with one JSON object.', user, (j) => {
+  const got = manualPodcastScript ? null : await askJson(kit, 'You write natural, factual, high-retention podcast conversations that open on a killer hook and keep people listening to the end. You answer with one JSON object.', user, (j) => {
     if (!Array.isArray(j.lines) || j.lines.length < (shorts ? 8 : 25)) return 'too few lines';
     if (j.lines.some((l: any) => !(Number(l.host) >= 1 && Number(l.host) <= hosts.length) || !clean(l.text))) return 'bad line';
     if (foreign && j.lines.filter((l: any) => clean(l.en)).length < j.lines.length * 0.8) return 'missing English translations';
@@ -751,12 +755,13 @@ RULES
 - Each character: id (c1, c2…), name, gender (female|male), and "look": a short visual description the animator uses — hair (style + colour), skin tone, clothes with colours, glasses/beard if any (e.g. "curly black hair, dark skin, yellow hoodie, round glasses").
 - Lines are short and natural (max 2 sentences). Performance tags before words: ${[...EMO_TAGS, 'nod', 'shake_head', 'think', 'shrug', 'hands_up', 'hand_chest', 'point', 'fist', 'wave', 'turn_left', 'turn_right', 'side_left', 'side_right', 'turn_around', 'face_front'].map((t) => `[${t}]`).join(' ')}.
 - Scene 1 opens with a hook. The final scene resolves the story.
+- ${REACH_RULES}
 - Characters move like in a real film: they arrive, cross the room, leave. Write scenes so people can walk in and out (e.g. someone arrives mid-scene, someone storms off).
 - LENGTH: ${size}.
 Return ONLY JSON: {"title": "max 60 chars", "logline": "one sentence", "description": "2-3 sentences for YouTube", "hashtags": ["5-8 specific hashtags without #"], "mood": "story|emotional|mystery|horror|upbeat", "characters": [{"id": "c1", "name": "", "gender": "female", "look": ""}], "scenes": [{"location": "bedroom", "time": "night", "card": "", "cast": ["c1", "c2"], "lines": [{"speaker": "c1", "text": "[worried] …"}]}]}`;
   // Studio → Create animation: the user's own script and characters, used exactly as written.
   const injected = (CFG as any).studioFilm;
-  const got = injected ? { j: injected, model: 'your script' } : await askJson(kit, 'You are an award-winning animation screenwriter. You answer with one JSON object.', user, (j) => {
+  const got = injected ? { j: injected, model: 'your script' } : await askJson(kit, 'You are an award-winning animation screenwriter whose shorts hook in two seconds, build real emotion and get shared. You answer with one JSON object.', user, (j) => {
     if (!Array.isArray(j.characters) || j.characters.length < 1 || !Array.isArray(j.scenes) || j.scenes.length < (shorts ? 1 : 3)) return 'missing cast or scenes';
     const ids = new Set(j.characters.map((c: any) => String(c.id)));
     const lines = j.scenes.flatMap((s: any) => (Array.isArray(s.lines) ? s.lines : []));
@@ -873,8 +878,9 @@ ${avoidTitles(kit)}
 - The overall winner wins most rounds and the FINAL round. Make it close (a comeback is best).
 - hook: one spoken line to open the video (max 10 words), a question or a bold claim.
 - verdict: one short spoken line for the end (max 10 words).
+- ${REACH_RULES}
 Return ONLY JSON: {"title": "e.g. SPEED vs STRENGTH | Who Really Wins? (max 70 chars)", "hook": "", "verdict": "", "description": "2 sentences for YouTube, ends with a question for the comments", "hashtags": ["5-8 hashtags without #"], "sides": [{"id": "A", "name": "", "label": "", "archetype": "speed", "color": "#2f45b8", "count": 1, "gear": "none"}], "rounds": [{"winner": "A", "lines": []}]}`;
-  const got = await askJson(kit, 'You design viral stick-figure "VS" fight videos. You answer with one JSON object.', user, (j) => {
+  const got = await askJson(kit, 'You design stick-figure "VS" fight videos built for maximum retention and comment debates. You answer with one JSON object.', user, (j) => {
     if (!Array.isArray(j.sides) || j.sides.length !== 2) return 'need two sides';
     if (!Array.isArray(j.rounds) || j.rounds.length < Math.max(1, nRounds - 1)) return 'too few rounds';
     if (j.rounds.some((r: any) => r.winner !== 'A' && r.winner !== 'B')) return 'bad round winner';

@@ -510,7 +510,7 @@ export interface ShotInput { start: number; end: number; focus: { t: number }[];
 
 export function planShots(inp: ShotInput): Shot[] {
   let h = 2166136261; for (let i = 0; i < inp.seed.length; i++) { h ^= inp.seed.charCodeAt(i); h = Math.imul(h, 16777619); }
-  const rnd = () => { h = Math.imul(h ^ (h >>> 13), 0x5bd1e995) >>> 0; h ^= h >>> 15; return (h % 100000) / 100000; };
+  const rnd = () => { h = Math.imul(h ^ (h >>> 13), 0x5bd1e995) >>> 0; h ^= h >>> 15; h >>>= 0; return (h % 100000) / 100000; };
   const pick = <T>(a: [T, number][]): T => { const tot = a.reduce((n, x) => n + x[1], 0); let r = rnd() * tot; for (const [k, w] of a) { r -= w; if (r <= 0) return k; } return a[0][0]; };
   const P = inp.portrait;
   const G = P ? 0.66 : 0.76;
