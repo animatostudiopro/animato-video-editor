@@ -14,7 +14,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { choreograph, vsFighters, planRound, roundHealth, equipSides, ARCHETYPES, type VsSide, type VsRound } from './stickman.ts';
+import { choreograph, vsFighters, planBestRound, roundHealth, equipSides, ARCHETYPES, type VsSide, type VsRound } from './stickman.ts';
 import { normalizeStudio } from './studio.ts';
 import { arenaOrder, ARENA_IDS } from './arenas.ts';
 
@@ -37,6 +37,8 @@ export interface Kit {
   /** Voice of the automation's presenter when it hosts the podcast. */
   hostVoice?: string;
   PipelineError: new (code: string, message: string) => Error;
+  /** Where the finished MP4 must end up (the publish step reads it from here). */
+  OUTPUT_VIDEO?: string;
 }
 /** Strong moments for the thumbnail (seconds; w = how strong). */
 export interface Highlight { t: number; w: number }
@@ -848,6 +850,8 @@ const MATCHUPS: { sides: VsSide[]; title: string; hook: string; verdict: string;
     sides: [{ id: 'A', name: 'Engineer', label: 'ENGINEER', archetype: 'tech', color: '#0f766e', count: 1, gear: 'hardhat' }, { id: 'B', name: 'AI Agent', label: 'AI AGENTS', archetype: 'tech', color: '#c2410c', count: 4, gear: 'antenna' }] },
   { title: 'NINJA vs SAMURAI | Who Wins?', hook: 'Ninja versus samurai. Only one walks away.', verdict: 'The samurai wins by one blade.', winners: ['A', 'B', 'B'],
     sides: [{ id: 'A', name: 'Ninja', label: 'NINJA', archetype: 'ninja', color: '#111827', count: 1, gear: 'hood' }, { id: 'B', name: 'Samurai', label: 'SAMURAI', archetype: 'sword', color: '#b91c1c', count: 1, gear: 'helmet' }] },
+  { title: 'BOXER vs KARATE MASTER | Who Wins?', hook: 'A boxer against a karate master. Fists or feet?', verdict: 'The karate master wins on the final kick.', winners: ['A', 'B', 'B'],
+    sides: [{ id: 'A', name: 'Boxer', label: 'BOXER', archetype: 'boxer', color: '#b91c1c', count: 1, gear: 'headband' }, { id: 'B', name: 'Karate Master', label: 'KARATE', archetype: 'karate', color: '#1d4ed8', count: 1, gear: 'headband' }] },
   { title: 'WIZARD vs ROBOT', hook: 'Magic versus machine.', verdict: 'Magic wins this time.', winners: ['B', 'A', 'A'],
     sides: [{ id: 'A', name: 'Wizard', label: 'MAGIC', archetype: 'magic', color: '#7c3aed', count: 1, gear: 'hood' }, { id: 'B', name: 'Robot', label: 'MACHINE', archetype: 'tech', color: '#475569', count: 1, gear: 'antenna' }] },
 ];
@@ -873,7 +877,7 @@ The video is a fight simulation between two sides to answer "which one is better
 ALREADY MADE (pick a different match-up):
 ${avoidTitles(kit)}
 
-- sides: exactly 2, ids "A" and "B". Each: name (short, e.g. "Speed", "AI Agent"), label (1-2 WORDS IN CAPITALS for the health bar, e.g. "SPEED", "AI AGENTS"), archetype (how it fights: ${ARCHETYPES.join(', ')}), color (strong hex colour that reads on white — e.g. red #b3150f, blue #2f45b8), count (1, or 3-8 for a crowd/army/swarm), gear (${gears.join(', ')}).
+- sides: exactly 2, ids "A" and "B". Each: name (short, e.g. "Speed", "AI Agent"), label (1-2 WORDS IN CAPITALS for the health bar, e.g. "SPEED", "AI AGENTS"), archetype (how it fights; karate = kicks and strikes with no weapons, boxer = fists only; use them for martial-arts matchups: ${ARCHETYPES.join(', ')}), color (strong hex colour that reads on white — e.g. red #b3150f, blue #2f45b8), count (1, or 3-8 for a crowd/army/swarm), gear (${gears.join(', ')}).
 - rounds: exactly ${nRounds}. Each has "winner" ("A" or "B") and optional "lines": at most 2 very short trash-talk lines (max 6 words) like {"side": "B", "when": "start", "text": "Too slow."} or {"side": "A", "when": "end", "text": "Blink and you miss it."}.
 - The overall winner wins most rounds and the FINAL round. Make it close (a comeback is best).
 - hook: one spoken line to open the video (max 10 words), a question or a bold claim.
@@ -943,9 +947,11 @@ Return ONLY JSON: {"title": "e.g. SPEED vs STRENGTH | Who Really Wins? (max 70 c
     const start = t;
     const cardEnd = start + 1.15;
     sfx.push({ t: start + 0.08, kind: 'bell' });
-    const beats = planRound(sides, r, ri, rounds.length, fightLen * 0.72, `${CFG.campaignId}:${CFG.partNumber}:${title}`);
+    const chOpts = { start: cardEnd + 0.25, lineDur: (text: string) => (lineClip.get(text)?.duration || 1) };
+    // Ten candidate rounds are planned and scored (variety, rhythm, both sides landing, a big moment); the best one is filmed.
+    const beats = planBestRound(sides, r, ri, rounds.length, fightLen * 0.72, `${CFG.campaignId}:${CFG.partNumber}:${title}`, chOpts);
     const fs0 = fighters.map((f) => ({ ...f }));
-    const ch = choreograph(fs0, beats, { start: cardEnd + 0.25, lineDur: (text) => (lineClip.get(text)?.duration || 1) });
+    const ch = choreograph(fs0, beats, chOpts);
     ch.lines.forEach((l) => { const c = lineClip.get(l.text); if (c) { placed.push({ at: l.t + 0.05, clip: c, speaker: l.actor, tags: [] }); l.end = l.t + c.duration + 0.2; } });
     sfx.push(...ch.sfx);
     // Bullet hits and ricochets, brass falling after every shot.
@@ -1001,10 +1007,116 @@ async function pool<T, R>(items: T[], n: number, fn: (x: T, i: number) => Promis
   return out;
 }
 
+/** Stickman category: 'fight' (built-in engine), 'explainer' or 'story' (Stickman Kino, run by the GitHub Actions workflow). */
+export function stickKindOf(CFG: any): 'fight' | 'explainer' | 'story' {
+  const v = String(CFG.stickKind || CFG.subGenre || '');
+  return /explain/i.test(v) ? 'explainer' : /stor/i.test(v) ? 'story' : 'fight';
+}
+
+/**
+ * Stickman Kino adapter (explainer videos, storytelling): github.com/dsauce/stickman-kino (MIT).
+ * Kino is an animation engine: a film is film.json (script, voice, music, clips) + scenes.js (choreography).
+ * Here the app's own AI writes those two files using Kino's own skills/docs as the instructions, then the
+ * Kino CLI makes voice + music + SFX, checks the layout and renders the MP4. If the check fails, the errors
+ * go back to the AI for a repair (up to 3 rounds). The workflow checks Kino out into ./stickman-kino
+ * (defaults to dsauce/stickman-kino; repo variable STICKMAN_KINO_REPO overrides it).
+ */
+const KINO_BUDGET_CHARS = 60000;
+function kinoGuide(root: string): string {
+  const parts: string[] = [];
+  const add = (f: string, cap: number) => { try { parts.push(`### ${path.relative(root, f)}\n${fs.readFileSync(f, 'utf8').slice(0, cap)}`); } catch { /* optional file */ } };
+  try { for (const d of fs.readdirSync(path.join(root, 'skills'))) add(path.join(root, 'skills', d, 'SKILL.md'), 9000); } catch { /* no skills folder */ }
+  add(path.join(root, 'docs', 'film-json.md'), 12000);
+  add(path.join(root, 'docs', 'engine-api.md'), 20000);
+  add(path.join(root, 'skills', 'stickman-animator', 'references', 'cookbook.md'), 12000);
+  return parts.join('\n\n').slice(0, KINO_BUDGET_CHARS);
+}
+function kinoSplit(text: string): { film: any; scenes: string; meta: any } {
+  const grab = (tag: string) => { const m = text.match(new RegExp(`===\\s*${tag}\\s*===\\s*([\\s\\S]*?)(?====\\s*[a-z.]+\\s*===|$)`, 'i')); return (m?.[1] || '').replace(/^```[a-z]*\n?|\n?```\s*$/gi, '').trim(); };
+  const film = JSON.parse(grab('film\\.json'));
+  const scenes = grab('scenes\\.js');
+  if (!scenes.includes('film.scene')) throw new Error('scenes.js has no film.scene(...) calls');
+  let meta: any = {}; try { meta = JSON.parse(grab('meta')); } catch { /* meta is optional */ }
+  return { film, scenes, meta };
+}
+async function stickmanKino(kit: Kit, category: 'explainer' | 'story'): Promise<AnimResult> {
+  const CFG = kit.CFG;
+  const root = path.resolve(process.env.STICKMAN_KINO_DIR || 'stickman-kino');
+  const cli = path.join(root, 'bin', 'stickman.mjs');
+  if (!fs.existsSync(cli)) throw new kit.PipelineError('kino_missing', 'Stickman Kino is not checked out on the runner. The Fetch Stickman Kino workflow step failed; check that dsauce/stickman-kino is reachable.');
+  if (!kit.OUTPUT_VIDEO) throw new kit.PipelineError('kino_output', 'The renderer did not say where the finished video goes.');
+  if (kit.CFG.offline || !kit.LLM?.hasKeys) throw new kit.PipelineError('script_retry', 'No AI model is available on the runner to write the film.');
+
+  const sh = (args: string[], timeoutMs: number) => kit.run('node', [cli, ...args], { timeoutMs });
+  if (!fs.existsSync(path.join(root, 'node_modules'))) {
+    await kit.reportStatus('running', 'Installing Stickman Kino', 18, 'First run on this runner: installing the animation engine and voice…');
+    const i = await kit.run('npm', ['ci', '--no-audit', '--no-fund', '--prefix', root], { timeoutMs: 10 * 60_000 });
+    if (i.code !== 0) throw new kit.PipelineError('kino_install', `npm install failed for Stickman Kino: ${String(i.stderr).slice(-400)}`);
+    const s = await sh(['setup'], 15 * 60_000);
+    if (s.code !== 0) kit.log(`kino setup exited ${s.code}: ${String(s.stderr).slice(-300)}`);
+  }
+
+  const portrait = kit.H >= kit.W;
+  const seconds = kit.IS_SHORTS ? 45 : 90;
+  const words = Math.round(seconds * 2.2);
+  const idea = clean(ideaOf(CFG), 300);
+  const guide = kinoGuide(root);
+  const system = `You are the director and animator of stickman films made with the Stickman Kino engine. Follow its documentation exactly: only use props, poses, characters, themes, music styles and engine calls that exist. You answer with the three blocks below and nothing else.\n\n${guide}`;
+  const brief = category === 'explainer'
+    ? `Make a ${seconds}-second stickman EXPLAINER about: "${idea || 'a surprising idea most people get wrong'}". Open on the most surprising fact (no greeting), explain it with one clear visual metaphor and real numbers or a chart where useful, end on a takeaway that makes people share.`
+    : `Make a ${seconds}-second stickman STORY${idea ? ` about: "${idea}"` : ' (invent a fresh, emotional one)'}. Hook in the first 2 seconds, one clear character goal, a twist near the end and a payoff people will comment on. Show it with acting and scenes, not just talking.`;
+  const rules = `Format ${portrait ? '9:16 (vertical)' : '16:9'}. About ${words} narrated words in total (about 22 words per 10 seconds). Visual change every 2-3 seconds, actions synced to the narration with sc.cue(). Never invent facts. Avoid these past titles:\n${avoidTitles(kit)}`;
+  const format = `Reply with exactly:\n=== film.json ===\n{the complete film.json: format ${portrait ? '9:16' : '16:9'}, theme, voice, music, clips with vo}\n=== scenes.js ===\n(the complete scenes.js, one film.scene per clip)\n=== meta ===\n{"title":"max 70 chars, keyword first, curiosity gap","description":"2 sentences ending with a question","hashtags":["5-8 words without #"]}`;
+
+  const dir = path.join(kit.WORK_DIR, 'kino-film');
+  let user = `${brief}\n${rules}\n\n${format}`, last: { film: any; scenes: string; meta: any } | null = null, model = '';
+  for (let round = 0; round < 3; round++) {
+    await kit.reportStatus('running', round ? `Fixing the film (round ${round + 1})` : 'Writing the film', 22 + round * 6, round ? 'The layout check found problems; the AI is fixing them.' : `Stickman ${category}: ${idea || 'new idea'}`);
+    let got: { film: any; scenes: string; meta: any } | null = null;
+    for await (const a of kit.LLM.attempts({ system, user, temperature: 0.7, maxTokens: 12000, timeoutMs: 240000, task: 'kino_film' })) {
+      try { got = kinoSplit(String(a.text || '')); model = `${a.provider}/${a.model}`; break; } catch (e: any) { kit.log(`Kino film from ${a.provider}/${a.model} unusable (${e?.message}).`); }
+    }
+    if (!got) throw new kit.PipelineError('script_retry', 'The AI model could not write a usable Stickman Kino film this time. Nothing was posted; the next attempt runs automatically.');
+    last = got;
+    fs.rmSync(dir, { recursive: true, force: true }); fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'film.json'), JSON.stringify(got.film, null, 2));
+    fs.writeFileSync(path.join(dir, 'scenes.js'), got.scenes);
+    await kit.reportStatus('running', 'Voice, music and layout check', 40 + round * 5, 'Recording the voice-over and checking every frame layout…');
+    const b = await sh(['build', dir, '--no-render'], 20 * 60_000);
+    if (b.code === 0) break;
+    const errs = `${b.stdout.toString().slice(-2500)}\n${String(b.stderr).slice(-2500)}`.trim();
+    kit.log(`Kino build round ${round + 1} failed: ${errs.slice(-600)}`);
+    if (round === 2) throw new kit.PipelineError('kino_check', 'Stickman Kino could not produce a clean film after 3 tries. Nothing was posted; the next attempt runs automatically.');
+    user = `${brief}\n${rules}\n\nYour previous files failed the Kino build. Fix ONLY what the errors say and return all three blocks again.\n\nERRORS:\n${errs}\n\nPREVIOUS film.json:\n${JSON.stringify(last.film)}\n\nPREVIOUS scenes.js:\n${last.scenes}\n\n${format}`;
+  }
+
+  await kit.reportStatus('running', 'Rendering the film', 60, `Rendering ${portrait ? 'vertical' : 'landscape'} video with Stickman Kino…`);
+  const r = await sh(['render', dir, '--quality', process.env.STICKMAN_KINO_QUALITY || 'looks', '--format', 'mp4'], 40 * 60_000);
+  if (r.code !== 0) throw new kit.PipelineError('render_failed', `Stickman Kino could not render the video: ${String(r.stderr).slice(-400)}`);
+  const renders = path.join(dir, 'renders');
+  const mp4 = fs.existsSync(renders) ? fs.readdirSync(renders).filter((f) => f.endsWith('.mp4')).map((f) => path.join(renders, f)).sort((x, y) => fs.statSync(y).mtimeMs - fs.statSync(x).mtimeMs)[0] : '';
+  if (!mp4) throw new kit.PipelineError('render_failed', 'Stickman Kino finished but no MP4 was found.');
+  fs.mkdirSync(path.dirname(kit.OUTPUT_VIDEO), { recursive: true });
+  fs.copyFileSync(mp4, kit.OUTPUT_VIDEO);
+  const duration = await kit.probeDuration(kit.OUTPUT_VIDEO);
+  const m = last?.meta || {};
+  const tags = cleanTags(m.hashtags);
+  const title = clean(m.title || last?.film?.title || (category === 'explainer' ? 'Explained in a minute' : 'A stickman story'), 100);
+  return {
+    title, description: `${clean(m.description, 700)}\n\nMade with Stickman Kino (MIT).`, hashtags: [...tags, 'stickman', category === 'explainer' ? 'explained' : 'storytime'].slice(0, 10),
+    tags: ['stickman', category, 'animation', ...tags], script: (last?.film?.clips || []).map((c: any) => String(c?.vo || '')).filter(Boolean).join('\n'),
+    durationSec: duration, character: 'stickman', model: model || 'template', sources: ['https://github.com/dsauce/stickman-kino'],
+  };
+}
+
 export const ANIM_CATEGORIES = new Set(['animation', 'podcast']);
 
 export async function runAnimated(kit: Kit): Promise<AnimResult> {
   const cat = String(kit.CFG.category || '').toLowerCase();
   if (cat === 'podcast') return podcast(kit);
-  return /stick/i.test(String(kit.CFG.animStyle || kit.CFG.subGenre || '')) ? stickman(kit) : film(kit);
+  if (/stick/i.test(String(kit.CFG.animStyle || kit.CFG.subGenre || ''))) {
+    const k = stickKindOf(kit.CFG);
+    return k === 'fight' ? stickman(kit) : stickmanKino(kit, k);
+  }
+  return film(kit);
 }

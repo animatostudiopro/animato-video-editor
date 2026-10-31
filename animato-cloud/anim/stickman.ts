@@ -96,6 +96,26 @@ export const POSES: Record<string, Pose> = {
   aimKick: P(-2, -2, 96, -12, 78, 22, 26, 20, -24, 22, -6),
   stabWind: P(-6, 0, 30, 140, 10, 130, 26, 20, -20, 20, -4),
   stab: P(28, -8, 90, 0, 30, 120, 36, 16, -38, 14, -10),
+  // Martial arts: snap / side / hook / spinning kicks, strikes, a judo hip throw, a bow.
+  frontSnap: P(-12, 4, 70, 110, 40, 120, 84, 6, -6, 6, 2),
+  lowKick: P(-4, 2, 70, 110, 40, 120, 58, 4, -12, 10),
+  sideChamber: P(-18, 6, 70, 100, 40, 110, 100, 130, -6, 6, 2),
+  sideKick: P(-55, 16, 130, 40, 110, 50, 92, 0, -4, 4, 6),
+  spinWind: P(36, 26, 30, 100, 10, 100, 44, 60, -22, 60, -16),
+  spinKick: P(-60, 20, 125, 60, 150, 40, 100, 0, -2, 4, 8),
+  hookKick: P(-32, 10, 40, 100, -50, 60, 142, 48, -8, 6, 6),
+  jumpSpin: P(-34, 10, 140, 50, 120, 60, 96, 0, -40, 90, 0),
+  backfistWind: P(-8, 6, 30, 150, 40, 120, 28, 18, -26, 18, -4),
+  backfist: P(22, -6, 96, -10, 36, 120, 34, 16, -34, 14, -8),
+  hammerWind: P(-16, 4, 172, 30, 40, 120, 26, 18, -24, 20, -2),
+  hammerDown: P(34, -14, 58, 8, 40, 120, 40, 26, -36, 16, -14),
+  shoulderWind: P(30, -8, -30, 70, -50, 60, 60, 80, -30, 40, -12),
+  shoulderHit: P(58, -20, -60, 30, -70, 30, 66, 50, -40, 10, -18),
+  hipSet: P(46, -8, 40, 50, 34, 56, 34, 50, -26, 40, -12),
+  hipTurn: P(82, -10, -40, 30, -50, 30, 22, 26, -44, 20, -2),
+  hookWind: P(-10, 4, 40, 110, 40, 120, 28, 18, -26, 18, -4),
+  hook: P(24, -8, 100, 70, 36, 120, 34, 16, -36, 14, -8),
+  bowDown: P(42, 22, 18, 10, 14, 10, 4, 4, -4, 4, -2),
 };
 
 export interface Key { pose: string; at: number } // at: seconds from action start
@@ -189,6 +209,21 @@ export const ACTIONS: Record<string, ActionDef> = {
   feint: { keys: [{ pose: 'guard', at: 0 }, { pose: 'feint', at: 0.14 }, { pose: 'guardB', at: 0.32 }, { pose: 'guard', at: 0.5 }], dur: 0.5, travel: -18, sfx: 'whoosh' },
   stalk: { keys: [{ pose: 'stalk1', at: 0 }, { pose: 'stalk2', at: 0.32 }, { pose: 'stalk1', at: 0.64 }], dur: 0.64, loop: true },
   recoil: { keys: [{ pose: 'recoil', at: 0 }, { pose: 'recoil', at: 0.16 }, { pose: 'guard', at: 0.42 }], dur: 0.42, travel: -70, sfx: '' },
+  // ---- Martial arts and boxing.
+  frontKick: { keys: [{ pose: 'guard', at: 0 }, { pose: 'kickChamber', at: 0.12 }, { pose: 'frontSnap', at: 0.2 }, { pose: 'frontSnap', at: 0.3 }, { pose: 'guard', at: 0.55 }], dur: 0.55, impact: 0.2, travel: 12, reach: 108, effect: 'launch', dmg: 9, sfx: 'kick' },
+  lowKick: { keys: [{ pose: 'guard', at: 0 }, { pose: 'lowKick', at: 0.1 }, { pose: 'lowKick', at: 0.18 }, { pose: 'guard', at: 0.4 }], dur: 0.4, impact: 0.1, travel: 8, reach: 100, effect: 'hit', dmg: 5, sfx: 'kick' },
+  sideKick: { keys: [{ pose: 'guard', at: 0 }, { pose: 'sideChamber', at: 0.16 }, { pose: 'sideKick', at: 0.28 }, { pose: 'sideKick', at: 0.42 }, { pose: 'guard', at: 0.7 }], dur: 0.7, impact: 0.28, travel: 14, reach: 124, effect: 'launchFar', dmg: 14, power: 1.2, sfx: 'kick' },
+  hookKick: { keys: [{ pose: 'guard', at: 0 }, { pose: 'kickChamber', at: 0.16 }, { pose: 'hookKick', at: 0.3 }, { pose: 'hookKick', at: 0.42 }, { pose: 'guard', at: 0.72 }], dur: 0.72, impact: 0.3, travel: 12, reach: 116, effect: 'down', dmg: 15, power: 1.2, sfx: 'kick' },
+  spinBackKick: { keys: [{ pose: 'guard', at: 0 }, { pose: 'spinWind', at: 0.2 }, { pose: 'spinKick', at: 0.4 }, { pose: 'spinKick', at: 0.54 }, { pose: 'guard', at: 0.86 }], dur: 0.86, impact: 0.4, travel: 40, reach: 126, effect: 'launchFar', dmg: 22, power: 1.5, sfx: 'heavy' },
+  jumpSpinKick: { keys: [{ pose: 'crouch', at: 0 }, { pose: 'air', at: 0.16 }, { pose: 'jumpSpin', at: 0.34 }, { pose: 'jumpSpin', at: 0.5 }, { pose: 'crouch', at: 0.7 }, { pose: 'guard', at: 0.9 }], dur: 0.9, impact: 0.38, travel: 150, arc: 80, reach: 190, effect: 'down', dmg: 21, power: 1.4, sfx: 'heavy' },
+  backfist: { keys: [{ pose: 'guard', at: 0 }, { pose: 'backfistWind', at: 0.1 }, { pose: 'backfist', at: 0.18 }, { pose: 'backfist', at: 0.28 }, { pose: 'guard', at: 0.46 }], dur: 0.46, impact: 0.18, travel: 16, reach: 86, effect: 'hit', dmg: 7, sfx: 'punch' },
+  hammerFist: { keys: [{ pose: 'guard', at: 0 }, { pose: 'hammerWind', at: 0.16 }, { pose: 'hammerDown', at: 0.26 }, { pose: 'hammerDown', at: 0.36 }, { pose: 'guard', at: 0.6 }], dur: 0.6, impact: 0.26, travel: 12, reach: 84, effect: 'launch', dmg: 11, power: 1.1, sfx: 'heavy' },
+  shoulder: { keys: [{ pose: 'crouch', at: 0 }, { pose: 'shoulderWind', at: 0.14 }, { pose: 'shoulderHit', at: 0.26 }, { pose: 'shoulderHit', at: 0.4 }, { pose: 'guard', at: 0.66 }], dur: 0.66, impact: 0.26, travel: 150, reach: 160, effect: 'launchFar', dmg: 16, power: 1.3, sfx: 'heavy' },
+  hipThrow: { keys: [{ pose: 'guard', at: 0 }, { pose: 'grab', at: 0.14 }, { pose: 'hipSet', at: 0.3 }, { pose: 'hipTurn', at: 0.5 }, { pose: 'hipTurn', at: 0.7 }, { pose: 'guard', at: 1.0 }], dur: 1.0, impact: 0.3, travel: 8, reach: 68, effect: 'thrown', dmg: 17, power: 1.2, sfx: 'whoosh' },
+  hook: { keys: [{ pose: 'guard', at: 0 }, { pose: 'hookWind', at: 0.1 }, { pose: 'hook', at: 0.2 }, { pose: 'hook', at: 0.3 }, { pose: 'guard', at: 0.5 }], dur: 0.5, impact: 0.2, travel: 16, reach: 84, effect: 'launch', dmg: 11, sfx: 'punch' },
+  boxCombo: { keys: [{ pose: 'guard', at: 0 }, { pose: 'jab', at: 0.08 }, { pose: 'guard', at: 0.16 }, { pose: 'jab', at: 0.22 }, { pose: 'guard', at: 0.3 }, { pose: 'punch', at: 0.38 }, { pose: 'hookWind', at: 0.5 }, { pose: 'hook', at: 0.58 }, { pose: 'guard', at: 0.86 }], dur: 0.86, impact: 0.58, hits: [0.08, 0.22, 0.38, 0.58], travel: 44, reach: 90, effect: 'launch', dmg: 5, power: 1.1, sfx: 'punch', hitSfx: 'jab' },
+  karateCombo: { keys: [{ pose: 'guard', at: 0 }, { pose: 'lowKick', at: 0.1 }, { pose: 'guard', at: 0.2 }, { pose: 'punchWind', at: 0.26 }, { pose: 'punch', at: 0.34 }, { pose: 'kickChamber', at: 0.44 }, { pose: 'frontSnap', at: 0.52 }, { pose: 'guard', at: 0.82 }], dur: 0.82, impact: 0.52, hits: [0.1, 0.34, 0.52], travel: 40, reach: 100, effect: 'launch', dmg: 6, power: 1.1, sfx: 'kick', hitSfx: 'jab' },
+  bow: { keys: [{ pose: 'stand', at: 0 }, { pose: 'bowDown', at: 0.4 }, { pose: 'bowDown', at: 0.8 }, { pose: 'guard', at: 1.2 }], dur: 1.2 },
   // Reactions (started by the choreographer at the moment of impact).
   hit: { keys: [{ pose: 'hit', at: 0 }, { pose: 'hit', at: 0.16 }, { pose: 'guard', at: 0.45 }], dur: 0.45, travel: -34, sfx: '' },
   stagger: { keys: [{ pose: 'hit', at: 0 }, { pose: 'hitHard', at: 0.08 }, { pose: 'hit', at: 0.16 }], dur: 0.16, loop: true },
@@ -205,7 +240,7 @@ export const ACTIONS: Record<string, ActionDef> = {
 };
 
 export const ATTACKS = Object.keys(ACTIONS).filter((k) => ACTIONS[k].impact !== undefined);
-export const MOVES = ['roll', 'run', 'dash', 'jump', 'dodge', 'duck', 'block', 'parry', 'feint', 'stalk', 'backflip', 'frontflip', 'slide', 'blink', 'taunt', 'flex', 'victory', 'getup', 'idle', ...ATTACKS];
+export const MOVES = ['roll', 'run', 'dash', 'jump', 'dodge', 'duck', 'block', 'parry', 'feint', 'stalk', 'backflip', 'frontflip', 'slide', 'blink', 'taunt', 'flex', 'bow', 'victory', 'getup', 'idle', ...ATTACKS];
 /** Reactions that end with the fighter on the floor. */
 const FLOORED = new Set(['down', 'launchFar', 'thrown', 'spiked', 'juggled']);
 /** Defensive answers the choreographer resolves against the blow before them. */
@@ -355,7 +390,7 @@ export function choreograph(fighters: Fighter[], beats: Beat[], opts: { start?: 
     }
     if (FLOORED.has(r)) downed[targetId] = true;
     if (ko) out[targetId] = true;
-    const high = move === 'uppercut' || move === 'roundhouse' ? 150 : move === 'kick' || move === 'flyingKick' ? 105 : A.ground ? 20 : 128;
+    const high = move === 'uppercut' || move === 'roundhouse' || move === 'hookKick' ? 150 : move === 'lowKick' ? 45 : ['kick', 'flyingKick', 'frontKick', 'sideKick', 'spinBackKick', 'jumpSpinKick'].includes(move) ? 108 : A.ground ? 20 : 128;
     impacts.push({ t: at, x: hitX, y: high + airY, kind: r, strength: (r === 'hit' ? 0.6 : 1) * (A.power || 1), target: targetId, attacker: actorId, dmg: (A.dmg || 8) * dmgScale, ko, ground: !!A.ground, move });
   };
   const skip = new Set<number>();
@@ -882,8 +917,10 @@ function roundedRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: num
 // ===========================================================================
 // VS fight planner — "Speed vs Strength", "King vs Army", "Engineer vs AI agents"
 // ===========================================================================
-export type Archetype = 'speed' | 'strength' | 'tech' | 'magic' | 'sword' | 'brawler' | 'ninja';
-export const ARCHETYPES: Archetype[] = ['speed', 'strength', 'tech', 'magic', 'sword', 'brawler', 'ninja'];
+export type Archetype = 'speed' | 'strength' | 'tech' | 'magic' | 'sword' | 'brawler' | 'ninja' | 'karate' | 'boxer';
+export const ARCHETYPES: Archetype[] = ['speed', 'strength', 'tech', 'magic', 'sword', 'brawler', 'ninja', 'karate', 'boxer'];
+/** Pure hand-to-hand styles: they never pick up a weapon. */
+const MARTIAL: Archetype[] = ['karate', 'boxer'];
 
 interface MoveSet { approach: 'run' | 'dash' | 'walk'; attacks: [string, number][]; defend: string[]; defendRate: number; finisher: string[]; openers: string[]; size: number; weapon: Weapon }
 export const MOVESETS: Record<Archetype, MoveSet> = {
@@ -893,6 +930,8 @@ export const MOVESETS: Record<Archetype, MoveSet> = {
   magic: { approach: 'run', attacks: [['blast', 3], ['beam', 2], ['kick', 1], ['axeKick', 1]], defend: ['dodge', 'backflip', 'parry'], defendRate: 0.35, finisher: ['beam', 'tornadoKick'], openers: ['taunt'], size: 1, weapon: 'staff' },
   sword: { approach: 'run', attacks: [['slash', 3], ['dashSlash', 2], ['kick', 1], ['elbow', 1], ['sweep', 1]], defend: ['block', 'dodge', 'parry', 'parry'], defendRate: 0.45, finisher: ['dashSlash', 'slash', 'juggle'], openers: ['taunt'], size: 1, weapon: 'sword' },
   brawler: { approach: 'run', attacks: [['punch', 3], ['combo', 3], ['kick', 2], ['uppercut', 2], ['elbow', 2], ['flyingKnee', 1], ['roundhouse', 1], ['throw', 1]], defend: ['block', 'duck', 'parry'], defendRate: 0.35, finisher: ['uppercut', 'roundhouse', 'throw', 'juggle'], openers: ['taunt'], size: 1.05, weapon: 'none' },
+  karate: { approach: 'run', attacks: [['frontKick', 3], ['sideKick', 2], ['roundhouse', 2], ['lowKick', 2], ['backfist', 2], ['hookKick', 1], ['hammerFist', 1], ['karateCombo', 2], ['punch', 2]], defend: ['block', 'block', 'parry', 'dodge', 'duck'], defendRate: 0.5, finisher: ['spinBackKick', 'jumpSpinKick', 'tornadoKick', 'hookKick', 'sideKick'], openers: ['bow'], size: 1, weapon: 'none' },
+  boxer: { approach: 'run', attacks: [['jab', 4], ['hook', 3], ['punch', 3], ['boxCombo', 3], ['uppercut', 2], ['combo', 2]], defend: ['block', 'block', 'duck', 'duck', 'dodge', 'parry'], defendRate: 0.55, finisher: ['boxCombo', 'uppercut', 'hook', 'heavyPunch'], openers: ['taunt'], size: 1.04, weapon: 'none' },
   ninja: { approach: 'dash', attacks: [['flyingKick', 2], ['kick', 2], ['roundhouse', 2], ['combo', 2], ['tornadoKick', 1], ['sweep', 2], ['axeKick', 1], ['blink', 1]], defend: ['backflip', 'dodge', 'duck', 'parry'], defendRate: 0.45, finisher: ['flyingKick', 'tornadoKick', 'juggle', 'axeKick'], openers: ['frontflip'], size: 0.95, weapon: 'none' },
 };
 
@@ -908,10 +947,12 @@ const EXCHANGES: Record<Archetype, [string, number][]> = {
   magic: [['zone', 3], ['dodgeCounter', 2], ['blinkStrike', 1], ['trade', 1], ['standoff', 1]],
   sword: [['clash', 2], ['parryPunish', 3], ['string', 2], ['dashThrough', 2], ['standoff', 2], ['feint', 1]],
   brawler: [['trade', 3], ['string', 2], ['throw', 2], ['blockCounter', 2], ['clash', 1], ['sweep', 1], ['feint', 1]],
+  karate: [['kickChain', 3], ['kataBurst', 3], ['blockCounter', 3], ['hipThrow', 1], ['sweep', 1], ['trade', 2], ['standoff', 2], ['feint', 1], ['shoulder', 1]],
+  boxer: [['boxing', 4], ['bobWeave', 3], ['trade', 2], ['blockCounter', 2], ['clinch', 1], ['standoff', 1], ['feint', 1]],
   ninja: [['juggle', 2], ['chase', 2], ['sweep', 2], ['string', 2], ['parryPunish', 1], ['blinkStrike', 1], ['standoff', 1]],
 };
-const LAUNCHERS = ['knifeCombo', 'kick', 'roundhouse', 'uppercut', 'tornadoKick', 'flyingKnee', 'heavyPunch', 'axeKick', 'slash'];
-const SHORT_HITS = ['jab', 'punch', 'combo', 'elbow', 'kick', 'slash', 'stab'];
+const LAUNCHERS = ['knifeCombo', 'kick', 'roundhouse', 'uppercut', 'tornadoKick', 'flyingKnee', 'heavyPunch', 'axeKick', 'slash', 'sideKick', 'spinBackKick', 'hookKick', 'frontKick', 'hook', 'boxCombo', 'shoulder'];
+const SHORT_HITS = ['jab', 'punch', 'combo', 'elbow', 'kick', 'slash', 'stab', 'lowKick', 'backfist', 'hammerFist', 'frontKick', 'hook'];
 
 export interface VsSide { id: 'A' | 'B'; name: string; label: string; archetype: Archetype; color: string; count: number; gear?: Gear; weapon?: Weapon; outfit?: Outfit }
 export interface VsRound { winner: 'A' | 'B'; lines?: { side: 'A' | 'B'; when: 'start' | 'end'; text: string }[] }
@@ -962,16 +1003,17 @@ export function equipSides(sides: VsSide[], seed: string): VsSide[] {
     const table: Record<Archetype, [string, number][]> = {
       speed: [['knife', 4], ['pistol', 3], ['none', 2]], strength: [['bat', 3], ['rifle', 3], ['none', 2]],
       tech: [['rifle', 5], ['pistol', 3]], magic: [['staff', 1]], sword: [['sword', 1]],
-      brawler: [['knife', 3], ['bat', 2], ['pistol', 2], ['none', 2]], ninja: [['knife', 3], ['sword', 3], ['none', 1]],
+      brawler: [['knife', 3], ['bat', 2], ['pistol', 2], ['none', 2]], karate: [['none', 1]], boxer: [['none', 1]], ninja: [['knife', 3], ['sword', 3], ['none', 1]],
     };
     return r.weighted(table[a] || [['none', 1]]) as Weapon;
   };
   const out = sides.map((sd) => ({ ...sd, weapon: sd.weapon || pickW(sd.archetype) }));
-  if (!out.some((x) => GUNS.has(x.weapon!)) && r.next() < 0.75) {
-    const c = out.filter((x) => !['sword', 'staff'].includes(x.weapon!));
+  const armable = (x: VsSide) => !['sword', 'staff'].includes(x.weapon!) && !MARTIAL.includes(x.archetype);
+  if (!out.some((x) => GUNS.has(x.weapon!)) && !out.every((x) => MARTIAL.includes(x.archetype)) && r.next() < 0.75) {
+    const c = out.filter(armable);
     if (c.length) r.pick(c).weapon = r.next() < 0.6 ? 'rifle' : 'pistol';
   }
-  if (!out.some((x) => ['knife', 'sword', 'bat'].includes(x.weapon!))) {
+  if (!out.some((x) => ['knife', 'sword', 'bat'].includes(x.weapon!)) && !out.some((x) => MARTIAL.includes(x.archetype))) {
     const c = out.filter((x) => x.weapon === 'none');
     if (c.length) c[0].weapon = 'knife';
   }
@@ -1038,7 +1080,7 @@ export function planRound(sides: VsSide[], round: VsRound, index: number, total:
       const ms = moveSetOf(sideOf(sid));
       const who = alive(sid)[0];
       const text = line(sid, 'start');
-      if (text) push({ actor: who, action: sid === W && ms.openers.includes('flex') ? 'flex' : 'taunt', line: text });
+      if (text) push({ actor: who, action: sid === W && ms.openers.includes('flex') ? 'flex' : ms.openers.includes('bow') ? 'bow' : 'taunt', line: text });
       else if (opening === 'showoff' && r.next() < 0.6) push({ actor: who, action: r.pick(ms.openers.filter((o) => !['dash', 'blink'].includes(o)).concat(['taunt'])) });
     }
   }
@@ -1112,6 +1154,38 @@ export function planRound(sides: VsSide[], round: VsRound, index: number, total:
         push({ actor: d, action: pickFrom(dms, ['heavyPunch', 'slash', 'axeKick', 'roundhouse', 'uppercut', 'tornadoKick'], 'kick'), target: a });
         break;
       }
+      case 'kickChain': {
+        // Low, middle, high: the legs work up the body, the last kick finishes it.
+        push({ actor: a, action: 'lowKick', target: d });
+        if (r.next() < defRate * 0.5) { push({ actor: d, action: r.pick(dms.defend) }); }
+        push({ actor: a, action: pickFrom(ams, ['frontKick', 'sideKick'], 'frontKick'), target: d });
+        finalBlow({ actor: a, action: pickFrom(ams, ['roundhouse', 'hookKick', 'sideKick', 'spinBackKick'], 'roundhouse'), target: d });
+        break;
+      }
+      case 'kataBurst': {
+        // Three different weapons of the body in one breath: hand, hand, leg.
+        push({ actor: a, action: pickFrom(ams, ['backfist', 'punch', 'jab', 'hammerFist'], 'punch'), target: d });
+        push({ actor: a, action: pickFrom(ams, ['hammerFist', 'punch', 'elbow'], 'punch'), target: d });
+        finalBlow({ actor: a, action: pickFrom(ams, ['karateCombo', 'hookKick', 'sideKick', 'roundhouse'], 'kick'), target: d });
+        break;
+      }
+      case 'hipThrow': finalBlow({ actor: a, action: 'hipThrow', target: d }); break;
+      case 'shoulder': finalBlow({ actor: a, action: 'shoulder', target: d }); break;
+      case 'boxing': {
+        // Jabs set it up; the hook or the combination lands.
+        push({ actor: a, action: 'jab', target: d });
+        if (r.next() < defRate * 0.7) { push({ actor: d, action: r.pick(['block', 'duck', 'parry']) }); finalBlow({ actor: a, action: 'boxCombo', target: d }); }
+        else finalBlow({ actor: a, action: pickFrom(ams, ['hook', 'boxCombo', 'uppercut'], 'hook'), target: d });
+        break;
+      }
+      case 'bobWeave': {
+        // Slip the punch, answer with the uppercut or a hook.
+        push({ actor: a, action: pickFrom(ams, ['hook', 'punch', 'jab'], 'punch'), target: d });
+        push({ actor: d, action: r.pick(['duck', 'duck', 'dodge']) });
+        push({ actor: d, action: pickFrom(dms, ['uppercut', 'hook', 'boxCombo', 'punch'], 'punch'), target: a });
+        break;
+      }
+      case 'clinch': push({ actor: a, action: 'elbow', target: d }); finalBlow({ actor: a, action: pickFrom(ams, ['uppercut', 'hook'], 'uppercut'), target: d }); break;
       case 'clash': push({ actor: a, action: 'clash', target: d }); break;
       case 'standoff': push({ actor: a, action: 'standoff', target: d }); if (r.next() < 0.6) push({ actor: a, action: 'feint' }); break;
       case 'feint': push({ actor: a, action: 'feint' }); finalBlow({ actor: a, action: attackOf(ams), target: d }); break;
@@ -1196,4 +1270,54 @@ export function roundHealth(ch: Choreo, fighters: { id: string; side: 'A' | 'B' 
   const last = out[out.length - 1];
   if (last[loser] > 0.5) out.push({ t: (ch.impacts[ch.impacts.length - 1]?.t ?? 0) + 0.01, A: loser === 'A' ? 0 : last.A, B: loser === 'B' ? 0 : last.B });
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Best-of-N planning
+// ---------------------------------------------------------------------------
+
+const QUIET = new Set(['standoff', 'taunt', 'flex', 'bow', 'victory', 'feint', 'block', 'dodge', 'duck', 'parry', 'backflip', 'roll', 'clash', 'blink', 'idle', 'run', 'dash', 'walk', 'stalk']);
+
+/**
+ * How watchable a planned round is (higher is better): variety of moves, no repeats back to back,
+ * a steady rhythm of blows without long lulls, a first blow inside the hook, both sides landing
+ * hits (a fight, not a beating), at least one big moment, and the right length.
+ */
+export function scoreRound(ch: Choreo, beats: Beat[], fighters: { id: string; side: 'A' | 'B' }[], seconds: number, start = 0): number {
+  const attacks = beats.filter((b) => b.target && !QUIET.has(b.action));
+  const names = attacks.map((b) => b.action);
+  const variety = names.length ? new Set(names).size / names.length : 0;
+  let repeats = 0;
+  for (let i = 1; i < attacks.length; i++) if (attacks[i].action === attacks[i - 1].action && attacks[i].actor === attacks[i - 1].actor) repeats++;
+  const hits = ch.impacts.filter((i) => i.kind !== 'land' && i.dmg !== 0).map((i) => ({ t: i.t - start, by: i.attacker }));
+  const ts = hits.map((h) => h.t).sort((a, b) => a - b);
+  let lull = 0;
+  for (let i = 1; i < ts.length; i++) lull = Math.max(lull, ts[i] - ts[i - 1]);
+  const dur = Math.max(1, ch.duration - start);
+  const rate = ts.length / dur; // blows per second
+  const sideOf = (id?: string) => fighters.find((f) => f.id === id)?.side;
+  const hitsBy = { A: 0, B: 0 };
+  hits.forEach((h) => { const sd = sideOf(h.by); if (sd) hitsBy[sd]++; });
+  const big = ch.impacts.some((i) => (i.strength || 0) >= 1.3);
+  let score = variety * 5 - repeats * 1.6;
+  score += Math.max(0, 2 - Math.abs(rate - 1.05) * 2.2);                 // rhythm
+  score -= Math.max(0, lull - 2.4) * 1.1;                                 // dead air
+  score += ts.length && ts[0] < 3.5 ? 1.2 : -1.5;                         // an early blow
+  score += Math.min(hitsBy.A, hitsBy.B) >= 2 ? 1.5 : -1;                  // both sides fight
+  score += big ? 1 : -1;                                                  // a big moment
+  score -= Math.abs(dur - seconds) / Math.max(4, seconds) * 3;            // right length
+  return score;
+}
+
+/** Plans several candidate rounds and keeps the most watchable one. Same inputs give the same round. */
+export function planBestRound(sides: VsSide[], round: VsRound, index: number, total: number, seconds: number, seed: string, opts: { start?: number; minDuration?: number; lineDur?: (text: string) => number } = {}, tries = 10): Beat[] {
+  const fighters = vsFighters(sides);
+  let best: Beat[] = [], bestScore = -Infinity;
+  for (let k = 0; k < tries; k++) {
+    const beats = planRound(sides, round, index, total, seconds, k ? `${seed}#${k}` : seed);
+    let sc = -Infinity;
+    try { sc = scoreRound(choreograph(fighters, beats, opts), beats, fighters, seconds, opts.start || 0); } catch { /* an unusable plan scores nothing */ }
+    if (sc > bestScore) { bestScore = sc; best = beats; }
+  }
+  return best.length ? best : planRound(sides, round, index, total, seconds, seed);
 }

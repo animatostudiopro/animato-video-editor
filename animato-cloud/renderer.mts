@@ -4850,6 +4850,7 @@ async function produceStudio(t0: number): Promise<number> {
   if (S.kind === 'stickman') {
     CFG.category = 'animation';
     (CFG as any).animStyle = 'stickman';
+    (CFG as any).stickKind = String((S as any).stickKind || 'fight');
     CFG.topic = S.script.slice(0, 300);
     CFG.allowFallbackPublish = true;      // never fail: a built-in match-up if the writer is unavailable
     await reportStatus('running', 'Planning the fight', 20, `Match-up: ${CFG.topic}`);
@@ -4943,7 +4944,7 @@ function animKit() {
     hostVoice: '',
     CFG, W: DW, H: DH, FPS, IS_SHORTS, WORK_DIR, HERE, LLM, extractJsonObject, log, reportStatus,
     run: (cmd: string, args: string[], o: { timeoutMs?: number } = {}) => run(cmd, args, o),
-    probeDuration, pastTitles: [] as string[], PipelineError,
+    probeDuration, pastTitles: [] as string[], PipelineError, OUTPUT_VIDEO,
     composeMusic: (mood: string, seconds: number, seed: string) => composeBuffers(mood as any, Math.max(10, seconds), seed),
     automateLevel, eqForVoice,
     runStage: (o: { stageFile: string; job: any; audioFinal: string; files: Record<string, string>; duration: number }) => runStage({

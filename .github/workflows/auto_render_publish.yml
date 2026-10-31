@@ -75,6 +75,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Stickman explainer / story videos come from the Stickman Kino repo. It defaults to
+      # dsauce/stickman-kino; override with the repo variable STICKMAN_KINO_REPO ("owner/name").
+      - name: Fetch Stickman Kino
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.STICKMAN_KINO_REPO || 'dsauce/stickman-kino' }}
+          path: stickman-kino
+          token: ${{ secrets.STICKMAN_KINO_TOKEN || github.token }}
+
       - name: Tell the app the runner started
         continue-on-error: true
         run: node animato-cloud/ping.mjs "Your GitHub runner started" 3 "Setting up the tools (about a minute)…" || true
